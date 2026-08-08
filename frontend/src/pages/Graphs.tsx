@@ -213,42 +213,30 @@ const Graphs = () => {
             <div className="mt-4 space-y-10">
               <GraphCard
                 index="01"
-                kicker="Sentiment distribution"
-                title="The average hides how divided the coverage was"
-                blurb={`Every scored article for ${stock.symbol}, grouped by ${bucketNoun}. The box spans the middle half, the line is the median, and the dots are outliers.`}
-                note="detecting polarisation. A score near zero can mean genuinely neutral coverage, or an even split between strongly positive and strongly negative articles — an average cannot tell you which."
+                title={`Article sentiment distribution by ${bucketNoun}`}
               >
                 <DistributionChart graph={stock} />
               </GraphCard>
 
               <GraphCard
                 index="02"
-                kicker="Reaction timeline"
-                title="Closing price, coverage volume and sentiment on one axis"
-                blurb={`Sentiment bars sit behind the close, and each marker grows with the number of articles published that ${bucketNoun}.`}
+                title={`Closing price, sentiment and article volume by ${bucketNoun}`}
                 caveat="Marker size = articles"
-                note="investigating event windows. Each measure keeps its own unit and its own axis, so nothing implies that a currency and a sentiment score are comparable quantities."
               >
                 <ReactionChart graph={stock} />
               </GraphCard>
 
               <GraphCard
                 index="06"
-                kicker="Range and coverage"
-                title="What the closing price alone does not show"
-                blurb={`Open, high, low and close per ${BUCKET_NOUN[stock.bars.bucket]}, with articles published in the panel below.`}
+                title={`Open, high, low and close by ${BUCKET_NOUN[stock.bars.bucket]}, with article volume`}
                 caveat="Close-derived range"
-                note="seeing whether a move was steady or violent. The range is built from the closes and hourly snapshots actually stored, not from an exchange feed, and the lower panel counts articles — Stocky stores no share volume."
               >
                 <CandlestickChart graph={stock} />
               </GraphCard>
 
               <GraphCard
                 index="07"
-                kicker="Trend and risk"
-                title="Moving averages frame the trend; drawdown measures the damage"
-                blurb={`Close with ${stock.maShortWindow}- and ${stock.maLongWindow}-${bucketNoun} trailing averages above, and the fall from the running peak below.`}
-                note="separating ordinary volatility from a sustained break. Each average is absent until its full window exists, so an early point is never a short average wearing a long label."
+                title={`Close with ${stock.maShortWindow}- and ${stock.maLongWindow}-${bucketNoun} trailing averages, and drawdown from peak`}
               >
                 <TrendRiskChart graph={stock} />
               </GraphCard>
@@ -267,10 +255,8 @@ const Graphs = () => {
             <div className="mt-4 space-y-10">
               <GraphCard
                 index="03"
-                kicker="Sentiment heatmap"
-                title="Coverage rotates between holdings rather than moving as one"
-                blurb={`Sentiment per ${bucketNoun} for every followed stock, sorted by the most recent reading. Blank cells are ${bucketNoun}s with no coverage at all.`}
-                note="scanning for clusters, reversals and persistent outliers across the whole watchlist at once. Click a row to load that stock above."
+                title={`Sentiment by ${bucketNoun}, every followed stock`}
+                caveat="Click a row to load it above"
               >
                 <SentimentHeatmap graph={universe} onSelect={setSymbol} />
               </GraphCard>
@@ -278,21 +264,15 @@ const Graphs = () => {
               <div className="grid gap-10 lg:grid-cols-2">
                 <GraphCard
                   index="04"
-                  kicker="Latest cross-section"
-                  title="Positive coverage does not always mean a positive return"
-                  blurb="Latest sentiment against the return over the price history stored for each stock, with bubble size as article count."
+                  title="Latest sentiment against period return"
                   caveat="Bubble = articles"
-                  note="separating stocks where price and coverage agree from the ones where they have come apart. Only stocks with both a price history and scored coverage appear."
                 >
                   <CrossSectionChart graph={universe} />
                 </GraphCard>
 
                 <GraphCard
                   index="05"
-                  kicker="Ranked divergence"
-                  title="Which narratives moved furthest from the price?"
-                  blurb="Sentiment change and price return, each standardised across the watchlist, then subtracted."
-                  note="prioritising what to read next. A large positive score means coverage improved faster than the price did; a negative one means the price ran ahead of the coverage."
+                  title="Standardised sentiment change minus standardised return"
                 >
                   <DivergenceChart graph={universe} />
                 </GraphCard>
