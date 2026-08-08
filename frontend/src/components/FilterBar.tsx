@@ -22,13 +22,14 @@ const FilterBar = ({ children }: { children: ReactNode }) => {
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-2 px-3 py-2 md:gap-3 md:px-5">
         {children}
 
-        {/* Width of the bar, not width of whatever is left over: the two pages
-            put different controls on the left, so a flex-1 nav put the tabs in
-            a different place on each and they jumped when you switched. A fixed
-            share of the row pins the divider to one spot on both. */}
+        {/* 320px right-aligned inside the same max-w/padding the pages use, so
+            the tabs sit centred over the right-hand rail — the Pinned tickers
+            column on the front page. Sized from the bar rather than from
+            whatever the controls left over, which differs per page and used to
+            make the tabs jump as you switched. */}
         <nav
           aria-label="Sections"
-          className="ml-auto flex w-[28%] min-w-[180px] shrink-0 items-center justify-center gap-4"
+          className="ml-auto flex w-80 max-w-full shrink-0 items-center justify-center gap-4"
         >
           {TABS.map((tab, index) => {
             const active = path === tab.path;
