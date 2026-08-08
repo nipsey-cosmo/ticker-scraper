@@ -57,7 +57,10 @@ const TrendingNews = ({ filter, onSelectSymbol, onOpenArticle }: TrendingNewsPro
                 // stored for [object Object] yet." Naming the parts that are
                 // actually set is what the message was reaching for.
                 `Nothing stored for ${describeFilter(filter)} yet.`
-              : 'No priced stocks on the watchlist yet — follow one to rank its news.'}
+              : // The server falls back to older news, and to unpriced stocks,
+                // before it returns nothing — so an empty section here means
+                // the table is genuinely empty, not that the ranking starved.
+                'No news stored yet — follow a stock and wait for the first scrape.'}
         </p>
       </section>
     );

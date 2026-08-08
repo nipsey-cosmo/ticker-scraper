@@ -507,9 +507,18 @@ class TestTrendingNews:
         results = client.get("/news/trending?days=30&per_stock=2").json()["results"]
         assert sum(1 for r in results if r["short_name"] == "AAPL") == 2
 
-    def test_unpriced_stocks_are_excluded(self, client):
-        results = client.get("/news/trending?days=30").json()["results"]
-        assert "6RJ0" not in {r["short_name"] for r in results}
+    def test_unpriced_stocks_rank_last(self, client):
+        """They have no move to rank by, but the lead section is better filled
+        with them than left short."""
+        symbols = [r["short_name"] for r in client.get("/news/trending?days=30").json()["results"]]
+        assert symbols[-1] == "6RJ0"
+
+    def test_a_stale_window_falls_back_to_older_news(self, client):
+        """The scrapers going quiet must not empty the page's lead section.
+        Nothing in the last two days means show what is stored instead."""
+        results = client.get("/news/trending?days=2").json()["results"]
+        assert results, "expected the stale-window fallback to fill the section"
+        assert results[0]["short_name"] == "TSLA"
 
     def test_symbol_filter_applies(self, client):
         results = client.get("/news/trending?days=30&symbols=AAPL").json()["results"]
