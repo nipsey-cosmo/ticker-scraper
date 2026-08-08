@@ -1,6 +1,6 @@
-import { ArrowLeft } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
+import FilterBar from '@/components/FilterBar';
 import TickerStrip from '@/components/TickerStrip';
 import GraphCard from '@/components/graphs/GraphCard';
 import {
@@ -19,7 +19,7 @@ import { useAppConfig } from '@/hooks/useAppConfig';
 import { useStockGraph, useUniverseGraph } from '@/hooks/useGraphs';
 import { useWatchlist } from '@/hooks/useWatchlist';
 import { formatPercent, formatSentiment } from '@/lib/format';
-import { linkProps, navigate } from '@/lib/router';
+import { navigate } from '@/lib/router';
 import { BUCKET_NOUN, DEFAULT_DAYS, TIMEFRAMES } from '@/types/graphs';
 
 /** "2026-08-02" → "2 Aug 2026". Dates from the API are already UTC days. */
@@ -85,6 +85,54 @@ const Graphs = () => {
         grading={config?.scrapingGradesImpact ?? false}
       />
 
+      <FilterBar>
+        <label className="flex shrink-0 items-center gap-1.5">
+          <span className="text-[11px] uppercase tracking-wide text-ink-muted">Stock</span>
+          <select
+            value={symbol ?? ''}
+            onChange={(event) => setSymbol(event.target.value)}
+            className="border border-rule bg-paper py-1.5 pl-2 pr-6 text-xs text-ink focus:border-ftblue focus:outline-none"
+          >
+            {watchlist.length === 0 && <option value="">No stocks followed</option>}
+            {watchlist.map((s) => (
+              <option key={s.symbol} value={s.symbol}>
+                {s.symbol}
+                {s.name ? ` — ${s.name}` : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="flex shrink-0 items-center gap-1.5">
+          <span className="text-[11px] uppercase tracking-wide text-ink-muted">Timeframe</span>
+          <div className="flex border border-rule">
+            {TIMEFRAMES.map((frame) => (
+              <button
+                key={frame.days}
+                type="button"
+                onClick={() => setDays(frame.days)}
+                aria-pressed={days === frame.days}
+                className={`border-r border-rule px-2.5 py-1 font-mono text-[11px] last:border-r-0 ${
+                  days === frame.days ? 'bg-ink-strong text-paper' : 'text-ink hover:bg-paper-tint'
+                }`}
+              >
+                {frame.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {stock && (
+          // The grid always runs to today and the scraper's last run is usually
+          // earlier, so without the date the empty right-hand edge of every
+          // chart reads as a rendering fault.
+          <p className="ft-meta shrink-0">
+            {stock.buckets.length} columns, one per {bucketNoun} · data through{' '}
+            {readableDate(dataThrough)}
+          </p>
+        )}
+      </FilterBar>
+
       <main className="mx-auto max-w-[1600px] px-3 py-6 md:px-5">
         {error && (
           <div className="mb-6 border-l-4 border-down bg-paper-tint px-4 py-3 text-sm">
@@ -94,64 +142,6 @@ const Graphs = () => {
             </p>
           </div>
         )}
-
-        <div className="flex flex-wrap items-end gap-x-6 gap-y-3 border-b border-rule pb-3">
-          <a
-            {...linkProps('/')}
-            className="flex items-center gap-1.5 text-xs text-ink-muted hover:text-ink-strong"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Front page
-          </a>
-
-          <label className="flex items-center gap-2 text-xs text-ink-muted">
-            <span className="font-mono uppercase tracking-[0.08em]">Stock</span>
-            <select
-              value={symbol ?? ''}
-              onChange={(event) => setSymbol(event.target.value)}
-              className="border border-rule bg-paper px-2 py-1 font-mono text-xs text-ink-strong"
-            >
-              {watchlist.length === 0 && <option value="">No stocks followed</option>}
-              {watchlist.map((s) => (
-                <option key={s.symbol} value={s.symbol}>
-                  {s.symbol}
-                  {s.name ? ` — ${s.name}` : ''}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="flex items-center gap-2 text-xs text-ink-muted">
-            <span className="font-mono uppercase tracking-[0.08em]">Timeframe</span>
-            <div className="flex border border-rule">
-              {TIMEFRAMES.map((frame) => (
-                <button
-                  key={frame.days}
-                  type="button"
-                  onClick={() => setDays(frame.days)}
-                  aria-pressed={days === frame.days}
-                  className={`border-r border-rule px-2.5 py-1 font-mono text-[11px] last:border-r-0 ${
-                    days === frame.days
-                      ? 'bg-ink-strong text-paper'
-                      : 'text-ink hover:bg-paper-tint'
-                  }`}
-                >
-                  {frame.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {stock && (
-            // The grid always runs to today and the scraper's last run is
-            // usually earlier, so without the date the empty right-hand edge of
-            // every chart reads as a rendering fault.
-            <p className="ft-meta ml-auto">
-              {stock.buckets.length} columns, one per {bucketNoun} · data through{' '}
-              {readableDate(dataThrough)}
-            </p>
-          )}
-        </div>
 
         {stock && (
           <section className="mt-5 grid grid-cols-2 gap-4 md:grid-cols-4">

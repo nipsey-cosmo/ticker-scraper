@@ -2,6 +2,7 @@ import { Search, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
 import ComboBox, { type ComboOption } from '@/components/ComboBox';
+import FilterBar from '@/components/FilterBar';
 import { useSectors } from '@/hooks/useSectors';
 import { useWatchlist } from '@/hooks/useWatchlist';
 import type { FeedFilter, SortKey } from '@/hooks/useStockNews';
@@ -64,9 +65,8 @@ const SearchBar = ({ filter, onChange, onClear }: SearchBarProps) => {
   const activeFilters = [filter.symbol, filter.sector, filter.query.trim()].filter(Boolean);
 
   return (
-    <div className="border-b border-rule bg-paper">
-      <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-2 px-3 py-2 md:gap-3 md:px-5">
-        <div className="relative w-full min-w-0 max-w-md flex-1">
+    <FilterBar>
+      <div className="relative w-full min-w-0 max-w-md flex-1">
           <Search
             className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-muted"
             aria-hidden="true"
@@ -169,8 +169,7 @@ const SearchBar = ({ filter, onChange, onClear }: SearchBarProps) => {
             <X className="h-3 w-3" aria-hidden="true" />
           </button>
         )}
-      </div>
-    </div>
+    </FilterBar>
   );
 };
 

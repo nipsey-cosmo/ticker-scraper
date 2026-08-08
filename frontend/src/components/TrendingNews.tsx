@@ -2,7 +2,7 @@ import Headline from '@/components/Headline';
 import NewsImage from '@/components/NewsImage';
 import ImpactTag from '@/components/ImpactTag';
 import TickerTag from '@/components/TickerTag';
-import { useTrendingNews, type FeedFilter } from '@/hooks/useStockNews';
+import { isSearching, useTrendingNews, type FeedFilter } from '@/hooks/useStockNews';
 import { formatAgeLong } from '@/lib/format';
 import type { NewsArticle } from '@/types/stock';
 
@@ -11,6 +11,12 @@ interface TrendingNewsProps {
   onSelectSymbol: (symbol: string) => void;
   onOpenArticle: (article: NewsArticle) => void;
 }
+
+/** The filter as the reader set it: "NVDA · Banks · “tariff”". */
+const describeFilter = (filter: FeedFilter) =>
+  [filter.symbol, filter.sector, filter.query.trim() && `“${filter.query.trim()}”`]
+    .filter(Boolean)
+    .join(' · ');
 
 const Meta = ({ article }: { article: NewsArticle }) => (
   <p className="ft-meta mt-1">
@@ -46,8 +52,11 @@ const TrendingNews = ({ filter, onSelectSymbol, onOpenArticle }: TrendingNewsPro
         <p className="mt-3 text-sm text-ink-muted">
           {isError
             ? 'Could not load trending stories.'
-            : filter
-              ? `Nothing stored for ${filter} yet.`
+            : isSearching(filter)
+              ? // Was `${filter}` — a FeedFilter object, so this read "Nothing
+                // stored for [object Object] yet." Naming the parts that are
+                // actually set is what the message was reaching for.
+                `Nothing stored for ${describeFilter(filter)} yet.`
               : 'No priced stocks on the watchlist yet — follow one to rank its news.'}
         </p>
       </section>
