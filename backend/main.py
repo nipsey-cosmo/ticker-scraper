@@ -19,6 +19,7 @@ import db
 import jobs
 import seed_catalogue
 import settings
+from routes.graphs import router as graphs_router
 from routes.insights import router as insights_router
 from routes.news import events_router, router as news_router
 from routes.stocks import router as stocks_router
@@ -63,6 +64,7 @@ app.include_router(news_router)
 app.include_router(events_router)
 app.include_router(watchlist_router)
 app.include_router(insights_router)
+app.include_router(graphs_router)
 app.include_router(ws_router)
 
 

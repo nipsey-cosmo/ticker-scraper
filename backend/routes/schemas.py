@@ -106,6 +106,86 @@ class PriceSeries(BaseModel):
     points: list[PricePoint]
 
 
+class BarSeries(BaseModel):
+    """Candles for the OHLC chart, on their own grid.
+
+    Separate from the page grid because a candle needs a range to draw, and a
+    daily candle here has none: outside the last day or two there is one
+    observation per day stored, so open, high, low and close are the same
+    number and every candle is a flat dash. Bucketing the candles to at least a
+    week gives them a real range built from real observations.
+    """
+    bucket: str
+    buckets: list[str]
+    labels: list[str]
+    open: list[Optional[float]]
+    high: list[Optional[float]]
+    low: list[Optional[float]]
+    close: list[Optional[float]]
+    articles: list[int]                    # the lower panel: coverage, not volume
+
+
+class StockGraph(BaseModel):
+    """One instrument on a bucket grid. Every list below is index-aligned to
+    `buckets`, nulls included — the client never has to join on a date."""
+    symbol: str
+    name: Optional[str] = None
+    currency: Optional[str] = None
+    bucket: str                            # 'day' | 'week' | 'month'
+    buckets: list[str]                     # bucket start dates, YYYY-MM-DD
+    labels: list[str]                      # the same, pre-formatted for an axis
+    close: list[Optional[float]]
+    bars: BarSeries
+    maShort: list[Optional[float]]
+    maLong: list[Optional[float]]
+    maShortWindow: int                     # in buckets, so the UI can label it
+    maLongWindow: int
+    drawdown: list[Optional[float]]        # percent below the running peak
+    sentiment: list[Optional[float]]       # article-weighted mean, −1..+1
+    articles: list[int]
+    positive: list[int]
+    negative: list[int]
+    neutral: list[int]
+    samples: list[list[float]]             # every scored article, per bucket
+    periodReturn: Optional[float] = None
+    # The days periodReturn actually spans — routinely narrower than the
+    # timeframe requested, because price history only goes back as far as the
+    # backfill did. The UI labels the figure with these, not with `days`.
+    returnFrom: Optional[str] = None
+    returnTo: Optional[str] = None
+    maxDrawdown: Optional[float] = None
+    correlation: Optional[float] = None
+    totalArticles: int = 0
+    # Most recent day holding a price or an article. The grid always runs to
+    # today; this says where the data stops.
+    dataThrough: Optional[str] = None
+
+
+class UniverseStock(BaseModel):
+    symbol: str
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    sentiment: list[Optional[float]]
+    articles: list[int]
+    latestSentiment: Optional[float] = None
+    sentimentChange: Optional[float] = None
+    periodReturn: Optional[float] = None
+    returnFrom: Optional[str] = None
+    returnTo: Optional[str] = None
+    # z(sentiment change) − z(return), across the universe. None when the stock
+    # is missing either input.
+    divergence: Optional[float] = None
+    totalArticles: int = 0
+
+
+class UniverseGraph(BaseModel):
+    bucket: str
+    buckets: list[str]
+    labels: list[str]
+    stocks: list[UniverseStock]
+    dataThrough: Optional[str] = None
+
+
 class TrendingStock(BaseModel):
     symbol: str
     name: Optional[str] = None
