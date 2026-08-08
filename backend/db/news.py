@@ -222,38 +222,45 @@ def get_trending(
     """Articles ranked by how far their stock has moved, biggest movers first.
 
     `per_stock` caps how many articles one ticker contributes, or a single
-    stock with heavy coverage would fill the whole section on its own. Stocks
-    with no quote yet are excluded — they have no move to rank by.
+    stock with heavy coverage would fill the whole section on its own.
+
+    This is the page's lead section, so it degrades rather than empties. Real
+    movers rank first; stocks with no quote yet sort last instead of dropping
+    out, and if `since` matches nothing the cutoff is dropped and the same
+    ranking runs over everything stored. A scraper that hasn't run for days
+    should show stale news, not a hole where the lead should be.
     """
     if short_names is not None and not short_names:
         return []
 
-    where, params = ["s.price_change_percent IS NOT NULL"], []
+    where, params = ["TRUE"], []
     if short_names:
         where.append(f"n.short_name IN ({','.join(['%s'] * len(short_names))})")
         params += short_names
-    if since:
-        where.append("n.publish_time >= %s")
-        params.append(since)
 
-    with get_connection() as conn:
-        return rows(conn.execute(f"""
-            WITH ranked AS (
-                SELECT n.*,
-                       s.price_change_percent AS move_percent,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY n.short_name
-                           ORDER BY n.publish_time DESC, n.id DESC
-                       ) AS rn
-                FROM news n
-                JOIN stocks s ON s.short_name = n.short_name
-                WHERE {' AND '.join(where)}
-            )
-            SELECT * FROM ranked
-            WHERE rn <= %s
-            ORDER BY ABS(move_percent) DESC, publish_time DESC, id DESC
-            LIMIT %s
-        """, [*params, per_stock, limit]))
+    def ranked(cutoff: str | None) -> list[dict]:
+        clause = " AND ".join(where + (["n.publish_time >= %s"] if cutoff else []))
+        args = [*params, *([cutoff] if cutoff else []), per_stock, limit]
+        with get_connection() as conn:
+            return rows(conn.execute(f"""
+                WITH ranked AS (
+                    SELECT n.*,
+                           s.price_change_percent AS move_percent,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY n.short_name
+                               ORDER BY n.publish_time DESC, n.id DESC
+                           ) AS rn
+                    FROM news n
+                    LEFT JOIN stocks s ON s.short_name = n.short_name
+                    WHERE {clause}
+                )
+                SELECT * FROM ranked
+                WHERE rn <= %s
+                ORDER BY ABS(move_percent) DESC NULLS LAST, publish_time DESC, id DESC
+                LIMIT %s
+            """, args))
+
+    return ranked(since) or (ranked(None) if since else [])
 
 
 def get_recent_fingerprints(short_name: str, days: int = 7) -> list[dict]:
