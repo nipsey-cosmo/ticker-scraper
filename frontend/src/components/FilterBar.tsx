@@ -22,25 +22,26 @@ const FilterBar = ({ children }: { children: ReactNode }) => {
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-2 px-3 py-2 md:gap-3 md:px-5">
         {children}
 
-        <nav aria-label="Sections" className="ml-auto flex shrink-0 items-center">
+        {/* Takes the whole leftover row and spreads the tabs through it, rather
+            than clustering them against the right edge. */}
+        <nav aria-label="Sections" className="flex flex-1 items-center justify-evenly">
           {TABS.map((tab, index) => {
             const active = path === tab.path;
-            return (
-              <span key={tab.path} className="flex items-center">
-                {index > 0 && <span className="px-2 text-rule">|</span>}
-                <a
-                  {...linkProps(tab.path)}
-                  aria-current={active ? 'page' : undefined}
-                  className={`font-mono text-xs uppercase tracking-[0.08em] ${
-                    active
-                      ? 'border-b-2 border-ftblue pb-0.5 font-semibold text-ink-strong'
-                      : 'pb-0.5 text-ink-muted hover:text-ink-strong'
-                  }`}
-                >
-                  {tab.label}
-                </a>
-              </span>
-            );
+            return [
+              index > 0 && <span key={`${tab.path}-sep`} className="text-rule">|</span>,
+              <a
+                key={tab.path}
+                {...linkProps(tab.path)}
+                aria-current={active ? 'page' : undefined}
+                className={`pb-0.5 font-mono text-xs uppercase tracking-[0.08em] ${
+                  active
+                    ? 'border-b-2 border-ftblue font-semibold text-ink-strong'
+                    : 'text-ink-muted hover:text-ink-strong'
+                }`}
+              >
+                {tab.label}
+              </a>,
+            ];
           })}
         </nav>
       </div>

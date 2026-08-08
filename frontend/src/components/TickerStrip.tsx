@@ -1,9 +1,8 @@
-import { LineChart, Sparkles } from 'lucide-react';
+import { Sparkles } from 'lucide-react';
 
 import Masthead from '@/components/Masthead';
 import WatchlistWheel from '@/components/WatchlistWheel';
 import { changeClass, formatPercent, formatPrice } from '@/lib/format';
-import { linkProps } from '@/lib/router';
 import type { Stock } from '@/types/stock';
 
 interface TickerStripProps {
@@ -76,15 +75,6 @@ const TickerStrip = ({
         </div>
 
         <Masthead flicker={grading} />
-
-        <a
-          {...linkProps('/graphs')}
-          aria-label="Graphs"
-          title="Price and sentiment graphs"
-          className="shrink-0 p-1 text-ink-muted hover:text-ink-strong"
-        >
-          <LineChart className="h-4 w-4" />
-        </a>
 
         <button
           type="button"
