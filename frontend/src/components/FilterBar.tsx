@@ -22,9 +22,14 @@ const FilterBar = ({ children }: { children: ReactNode }) => {
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-2 px-3 py-2 md:gap-3 md:px-5">
         {children}
 
-        {/* Takes the whole leftover row and spreads the tabs through it, rather
-            than clustering them against the right edge. */}
-        <nav aria-label="Sections" className="flex flex-1 items-center justify-evenly">
+        {/* Width of the bar, not width of whatever is left over: the two pages
+            put different controls on the left, so a flex-1 nav put the tabs in
+            a different place on each and they jumped when you switched. A fixed
+            share of the row pins the divider to one spot on both. */}
+        <nav
+          aria-label="Sections"
+          className="ml-auto flex w-[28%] min-w-[180px] shrink-0 items-center justify-center gap-4"
+        >
           {TABS.map((tab, index) => {
             const active = path === tab.path;
             return [
