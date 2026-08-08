@@ -1,6 +1,7 @@
 import { ArrowLeft } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 
+import TickerStrip from '@/components/TickerStrip';
 import GraphCard from '@/components/graphs/GraphCard';
 import {
   CandlestickChart,
@@ -14,10 +15,11 @@ import {
   SentimentHeatmap,
 } from '@/components/graphs/UniverseCharts';
 import { API_BASE_URL } from '@/config/api';
+import { useAppConfig } from '@/hooks/useAppConfig';
 import { useStockGraph, useUniverseGraph } from '@/hooks/useGraphs';
 import { useWatchlist } from '@/hooks/useWatchlist';
 import { formatPercent, formatSentiment } from '@/lib/format';
-import { linkProps } from '@/lib/router';
+import { linkProps, navigate } from '@/lib/router';
 import { BUCKET_NOUN, DEFAULT_DAYS, TIMEFRAMES } from '@/types/graphs';
 
 /** "2026-08-02" → "2 Aug 2026". Dates from the API are already UTC days. */
@@ -48,6 +50,7 @@ const Metric = ({ label, value, note, tone }: {
  */
 const Graphs = () => {
   const { watchlist, error } = useWatchlist();
+  const { config } = useAppConfig();
   const [days, setDays] = useState<number>(DEFAULT_DAYS);
   const [symbol, setSymbol] = useState<string | null>(null);
 
@@ -70,20 +73,17 @@ const Graphs = () => {
 
   return (
     <div className="min-h-screen bg-paper">
-      <header className="border-b border-rule bg-paper">
-        <div className="mx-auto flex h-12 max-w-[1600px] items-center gap-3 px-3 md:px-5">
-          <a
-            {...linkProps('/')}
-            className="flex items-center gap-1.5 text-xs text-ink-muted hover:text-ink-strong"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back to the front page
-          </a>
-          <span className="ml-auto shrink-0 border-l border-rule pl-3 font-serif text-base font-bold tracking-tight md:text-lg">
-            Graphs
-          </span>
-        </div>
-      </header>
+      {/* The same strip as the front page, so the masthead and the quotes stay
+          put when you switch tabs. The wheel and the AI button belong to the
+          front page's state, so they take you there rather than duplicating
+          two dialogs and their hooks on a page about charts. */}
+      <TickerStrip
+        stocks={watchlist}
+        onEdit={() => navigate('/')}
+        onOpenAiSettings={() => navigate('/')}
+        onSelect={setSymbol}
+        grading={config?.scrapingGradesImpact ?? false}
+      />
 
       <main className="mx-auto max-w-[1600px] px-3 py-6 md:px-5">
         {error && (
@@ -95,31 +95,15 @@ const Graphs = () => {
           </div>
         )}
 
-        <section className="ft-section">
-          <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-ftblue">
-            Price and sentiment intelligence
-          </p>
-          <h1 className="ft-headline mt-2 text-4xl leading-none md:text-5xl">
-            Price tells you what. Sentiment asks why.
-          </h1>
-          <p className="mt-3 max-w-3xl text-sm leading-relaxed text-ink-muted">
-            Seven views over the stocks you follow and the coverage scraped for them.
-            Everything here is your own stored data — daily closes, and every article
-            the scraper scored on a −1 to +1 scale. Nothing is modelled, and nothing
-            is advice.
-          </p>
-        </section>
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-3 border-b border-rule pb-3">
+          <a
+            {...linkProps('/')}
+            className="flex items-center gap-1.5 text-xs text-ink-muted hover:text-ink-strong"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Front page
+          </a>
 
-        {/* Deliberately loud: the grid always runs to today, and the scraper's
-            last run is usually earlier. Without this the empty right-hand end
-            of every chart reads as a rendering bug. */}
-        <div className="mt-4 border-l-4 border-ftblue bg-paper-tint px-4 py-2.5 font-mono text-[11px] leading-relaxed text-ink-muted">
-          <strong className="text-ink-strong">Data through {readableDate(dataThrough)}.</strong>{' '}
-          Charts run to today, so any gap at the right-hand edge is coverage the scraper
-          has not collected yet, not missing rendering.
-        </div>
-
-        <div className="mt-4 flex flex-wrap items-end gap-x-6 gap-y-3 border-y border-rule py-3">
           <label className="flex items-center gap-2 text-xs text-ink-muted">
             <span className="font-mono uppercase tracking-[0.08em]">Stock</span>
             <select
@@ -159,8 +143,12 @@ const Graphs = () => {
           </div>
 
           {stock && (
-            <p className="ft-meta">
-              One column = one {bucketNoun}. {stock.buckets.length} columns.
+            // The grid always runs to today and the scraper's last run is
+            // usually earlier, so without the date the empty right-hand edge of
+            // every chart reads as a rendering fault.
+            <p className="ft-meta ml-auto">
+              {stock.buckets.length} columns, one per {bucketNoun} · data through{' '}
+              {readableDate(dataThrough)}
             </p>
           )}
         </div>
