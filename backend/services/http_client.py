@@ -109,7 +109,10 @@ _HOST_RATES: dict[str, tuple[float, float]] = {
     "www.bing.com": (1.0, 4.0),
     "api.nasdaq.com": (1.0, 4.0),
     "www.nasdaq.com": (1.0, 3.0),
-    "www.sec.gov": (2.0, 8.0),
+    # SEC states 10 req/s across all its hosts *combined*, so the two are
+    # capped to share that budget rather than each claiming it.
+    "www.sec.gov": (2.0, 4.0),
+    "data.sec.gov": (2.0, 4.0),
     "quote.cnbc.com": (2.0, 6.0),
     # A CSV download rather than an API, and a small operation. Kept low
     # deliberately: it is a fallback, so it only runs when something else has

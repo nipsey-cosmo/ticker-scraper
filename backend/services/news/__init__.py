@@ -40,12 +40,24 @@ from normalize import days_ago_iso
 from .. import dedup, events, sentiment_service, symbols
 from . import bing_news, finviz, google_news, images, nasdaq_news, sec_edgar, yahoo_news
 
-__all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images"]
+__all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
+           "FAST_SOURCES"]
+
+# The two-minute lane. Filings are the only source where minutes matter:
+# an 8-K lands here before anybody has written about it. Everything else
+# is somebody's write-up and can wait for the hour.
+FAST_SOURCES = frozenset({sec_edgar.SOURCE_TYPE})
 
 
 def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
-            exchange: str | None, days: int = 2) -> list[dict]:
-    """Every source's articles for one stock, unmerged."""
+            exchange: str | None, days: int = 2,
+            only: frozenset[str] | None = None) -> list[dict]:
+    """Every source's articles for one stock, unmerged.
+
+    `only` restricts the fan-out to one lane's sources. A source outside the
+    lane is neither fetched nor recorded as skipped — it was not asked because
+    this is not its turn, which is not the same as being unavailable.
+    """
     ticker = yahoo_symbol or short_name
     us_ticker = ticker.split(".")[0]
     tasks: list[tuple[str, object]] = []
@@ -81,11 +93,19 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
         skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
                         sec_edgar.SOURCE_TYPE})
 
+    if only is not None:
+        tasks = [task for task in tasks if task[0] in only]
+        skipped &= only
+
     articles: list[dict] = []
     # Counted here rather than after the merge in refresh(): once the lists are
     # concatenated there is no telling which source produced what, and a source
     # returning nothing leaves no trace at all in the merged result.
     found: dict[str, int] = {}
+
+    if not tasks:
+        _record(found, skipped)
+        return articles
 
     with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="news") as pool:
         futures = [(source, pool.submit(task)) for source, task in tasks]
@@ -98,12 +118,15 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
             found[source] = found.get(source, 0) + len(batch)
             articles += batch
 
+    _record(found, skipped)
+    return articles
+
+
+def _record(found: dict[str, int], skipped: set[str]) -> None:
     try:
         db.sources.record(found, skipped)
     except Exception as exc:                 # telemetry must never fail a scrape
         print(f"[news] could not record source yield: {type(exc).__name__}: {exc}")
-
-    return articles
 
 
 def _aliases(stock: dict) -> tuple[str, ...]:
@@ -117,7 +140,7 @@ def _aliases(stock: dict) -> tuple[str, ...]:
 
 
 def refresh(short_name: str, days: int = 2, score: bool = True,
-            detect_events: bool = True) -> dict:
+            detect_events: bool = True, only: frozenset[str] | None = None) -> dict:
     """Scrape, dedupe and store news for one stock."""
     stock = db.stocks.get_stock(short_name) or {}
     company_name = stock.get("name") or short_name
@@ -125,10 +148,13 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
     raw = collect(
         short_name, company_name,
         stock.get("yahoo_symbol"), stock.get("exchange"),
-        days=days,
+        days=days, only=only,
     )
     if not raw:
-        print(f"[news] no source returned anything for {short_name}")
+        # The fast lane finds nothing on most ticks for most stocks. Saying so
+        # every two minutes per stock buries the hourly lane's output.
+        if only is None:
+            print(f"[news] no source returned anything for {short_name}")
         return {"short_name": short_name, "found": 0, "inserted": 0, "dropped": {}}
 
     existing = db.news.get_recent_fingerprints(short_name, days=max(days, 7))
@@ -154,8 +180,9 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
         except Exception as exc:
             print(f"[events] {short_name} failed: {type(exc).__name__}: {exc}")
 
-    print(f"[news] {short_name}: {len(raw)} found -> {len(inserted_ids)} new "
-          f"(dropped {prepared.dropped}, enriched {len(prepared.enrichments)})")
+    if inserted_ids or only is None:
+        print(f"[news] {short_name}: {len(raw)} found -> {len(inserted_ids)} new "
+              f"(dropped {prepared.dropped}, enriched {len(prepared.enrichments)})")
 
     return {
         "short_name": short_name,
@@ -176,8 +203,12 @@ def backfill(short_name: str, days: int | None = None) -> dict:
     return result
 
 
-def refresh_watchlist(days: int = 2) -> dict:
-    """Hourly job across every followed stock."""
+def refresh_watchlist(days: int = 2, only: frozenset[str] | None = None,
+                      detect_events: bool = True) -> dict:
+    """Scheduled sweep across every followed stock.
+
+    `only=FAST_SOURCES` is the two-minute lane; the default is the hourly one.
+    """
     watched = db.watchlist.get_symbols()
     if not watched:
         return {"stocks": 0, "inserted": 0}
@@ -185,12 +216,16 @@ def refresh_watchlist(days: int = 2) -> dict:
     total_inserted = 0
     for short_name in watched:
         try:
-            total_inserted += refresh(short_name, days=days)["inserted"]
+            total_inserted += refresh(short_name, days=days, only=only,
+                                      detect_events=detect_events)["inserted"]
         except Exception as exc:
             print(f"[news] {short_name} failed: {type(exc).__name__}: {exc}")
 
-    images.backfill_images(watched)
-    prune()
+    # Both cost a fetch per article and a filing carries no image, so the
+    # fast lane stores and moves on. Pruning is a daily concern either way.
+    if only is None:
+        images.backfill_images(watched)
+        prune()
 
     print(f"[news] refresh complete: {total_inserted} new articles across {len(watched)} stocks")
     return {"stocks": len(watched), "inserted": total_inserted}

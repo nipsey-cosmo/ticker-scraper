@@ -78,6 +78,9 @@ BACKFILL_DAYS = _int("STOCKY_BACKFILL_DAYS", 30)      # history pulled for a new
 PRICE_REFRESH_OPEN_MINUTES = _int("STOCKY_PRICE_REFRESH_OPEN_MINUTES", 5)
 PRICE_REFRESH_MINUTES = _int("STOCKY_PRICE_REFRESH_MINUTES", 60)
 NEWS_REFRESH_MINUTES = _int("STOCKY_NEWS_REFRESH_MINUTES", 60)
+# The fast lane carries only sources where minutes matter — a filing is
+# public the moment it is accepted, and the write-ups follow it.
+NEWS_FAST_MINUTES = _int("STOCKY_NEWS_FAST_MINUTES", 2)
 QUOTE_STALE_MINUTES = _int("STOCKY_QUOTE_STALE_MINUTES", 15)   # serve cached quote under this age
 NEWS_RETENTION_DAYS = _int("STOCKY_NEWS_RETENTION_DAYS", 120)
 

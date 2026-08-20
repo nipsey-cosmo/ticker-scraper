@@ -48,6 +48,18 @@ def refresh_news() -> dict:
     return result
 
 
+def refresh_news_fast() -> dict:
+    """Two-minute lane. Filings only, stored and scored but not judged.
+
+    Event detection is an LLM call per batch; running it every two minutes
+    across the watchlist would spend a day's tokens by lunchtime for no more
+    signal than the hourly pass gives. The fast lane's job is to get the
+    filing into the feed the minute it exists.
+    """
+    return news.refresh_watchlist(days=2, only=news.FAST_SOURCES,
+                                  detect_events=False)
+
+
 def aggregate_sentiment() -> int:
     """Daily. Rebuild the sentiment rollups the trending panels read."""
     sentiment_service.score_unscored()

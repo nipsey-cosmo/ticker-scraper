@@ -231,7 +231,28 @@ polite.
 
 ### 2.1 — B1 + A3 · EDGAR on data.sec.gov, and a fast lane
 
-- [ ] `feat: real-time filings from data.sec.gov on a two-minute lane`
+- [x] `feat: real-time filings from data.sec.gov on a two-minute lane`
+
+**Done.** The lane is a filter, not a second pipeline: `collect(only=...)`
+drops the tasks outside the lane and `refresh`/`refresh_watchlist` thread it
+through, so the fast lane is the same scrape-dedupe-store path with a smaller
+source list. A source outside the lane is **not** recorded as skipped - only a
+source that was genuinely unavailable is, or 1.5's `stalled` flag would drown
+in thirty skips every two minutes.
+
+`published_at` now comes from `acceptanceDateTime`, not `filingDate`. A date
+alone gives every filing that day the same timestamp, which makes a
+two-minute lane pointless - that, not the ten-minute lag, was the real reason
+the Atom feed could not be polled fast.
+
+`primaryDocDescription` is usually the form again (`"8-K"`), which would have
+titled as "Apple Inc. filed 8-K: 8-K", so it is dropped when it only repeats
+the form. Both SEC hosts were cut to a ceiling of 4.0 each: the stated 10 req/s
+is across `sec.gov` **and** `data.sec.gov` combined, and `www.sec.gov` alone
+was already at 8.0.
+
+Fast-lane logging is gated - a per-stock "found nothing" line every two
+minutes buries the hourly lane's output in a live run.
 
 **Files** `backend/services/news/sec_edgar.py`, `backend/scheduler.py`,
 `backend/jobs.py`, `backend/settings.py`, `backend/tests/test_news_sources.py`

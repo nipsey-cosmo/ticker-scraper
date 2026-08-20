@@ -28,6 +28,14 @@ scheduler.add_job(
     max_instances=1, coalesce=True,
 )
 
+# The fast lane, for sources where minutes matter. Cheap because 1.1's
+# conditional GET turns an unchanged feed into a 304 with no body.
+scheduler.add_job(
+    jobs.refresh_news_fast, "interval",
+    minutes=settings.NEWS_FAST_MINUTES, id="news_fast",
+    max_instances=1, coalesce=True,
+)
+
 # Rollups after the US close (21:30 UTC in summer), then housekeeping.
 scheduler.add_job(jobs.aggregate_sentiment, "cron", hour=22, minute=0, id="sentiment")
 scheduler.add_job(jobs.prune, "cron", hour=3, minute=30, id="prune")
@@ -40,7 +48,8 @@ def main() -> None:
     db.create_tables()
     print(f"[scheduler] prices every {settings.PRICE_REFRESH_OPEN_MINUTES}m while a market "
           f"is open ({settings.PRICE_REFRESH_MINUTES}m otherwise), "
-          f"news every {settings.NEWS_REFRESH_MINUTES}m")
+          f"news every {settings.NEWS_REFRESH_MINUTES}m "
+          f"(filings every {settings.NEWS_FAST_MINUTES}m)")
 
     # Bring everything current on start rather than idling until the first tick.
     jobs.catch_up()
