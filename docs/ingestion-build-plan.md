@@ -26,12 +26,28 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 | Part | Branch | Base | Commits | State |
 |---|---|---|---|---|
 | 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
-| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | ready |
-| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | blocked on 2 |
+| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 6 / 6 | **done, green, unmerged** |
+| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | ready |
 
 Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
-`eslint` clean. Live smoke on 5100/3100 passed — all seven news sources
-returned articles, real OHLCV stored, no console errors on `/` or `/graphs`.
+`eslint` clean.
+
+Suite at the end of Part 2: **731 backend passed + 13 skipped** (the live
+suite, opt-in), **128 frontend / 15 files**, `eslint` clean.
+
+Live smoke on 5100/3100 passed. `POST /refresh` over an 11-stock watchlist:
+EDGAR went 5 → **225 filings** with real acceptance times rather than
+midnight; **38 article bodies** extracted; NVDA earnings **2026-08-26 post**;
+**5 of 11** stocks matched the mention table, including `6RJ0` → `RKLB`
+through the alias path. The wire firehose answered with 63 items across all
+three wires (Business Wire 39 → 23 after the language filter) and matched no
+watchlist company in that window — recorded as `WIRES fetches=11 articles=0`,
+which is the honest answer for a 63-item snapshot, not a dead source. No
+console errors on `/` or `/graphs`.
+
+**Carried into Part 3:** 3.4 is no longer speculative — two hosts are
+actively refusing (stooq.com, accessnewswire.com). The evidence is written
+into that sub-point.
 
 ---
 
