@@ -39,6 +39,9 @@ scheduler.add_job(
 # Rollups after the US close (21:30 UTC in summer), then housekeeping.
 scheduler.add_job(jobs.aggregate_sentiment, "cron", hour=22, minute=0, id="sentiment")
 scheduler.add_job(jobs.prune, "cron", hour=3, minute=30, id="prune")
+# Before the US pre-market window, so a date announced overnight is on the
+# stock before anyone looks at it.
+scheduler.add_job(jobs.refresh_earnings, "cron", hour=9, minute=0, id="earnings")
 
 # No catalogue job: instruments arrive from Yahoo search when one is followed
 # (see routes/watchlist.py), so there is nothing to bulk refresh.
@@ -56,6 +59,7 @@ def main() -> None:
     jobs.refresh_prices()
     jobs.refresh_news()
     jobs.aggregate_sentiment()
+    jobs.refresh_earnings()
 
     try:
         scheduler.start()

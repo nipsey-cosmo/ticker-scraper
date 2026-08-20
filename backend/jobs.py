@@ -11,7 +11,7 @@ import time
 import db
 import settings
 from normalize import days_ago_iso, markets_open
-from services import news, prices, sentiment_service
+from services import calendar, news, prices, sentiment_service
 
 # One backfill per symbol at a time. Adding a stock twice in quick succession
 # would otherwise fan out two identical month-long scrapes.
@@ -66,6 +66,15 @@ def aggregate_sentiment() -> int:
     count = db.sentiment.aggregate_all(days=settings.NEWS_RETENTION_DAYS)
     print(f"[jobs] aggregated sentiment for {count} stock-days")
     return count
+
+
+def refresh_earnings() -> dict:
+    """Daily. The next earnings date for every followed US listing.
+
+    One request per day scanned, so it is a small sweep and there is nothing
+    to gain from running it more often — a date does not move hourly.
+    """
+    return {"updated": calendar.refresh_watchlist()}
 
 
 def prune() -> dict:
@@ -133,4 +142,5 @@ def refresh_all() -> dict:
         "prices": refresh_prices(),
         "news": refresh_news(),
         "sentiment_days": aggregate_sentiment(),
+        "earnings": refresh_earnings(),
     }

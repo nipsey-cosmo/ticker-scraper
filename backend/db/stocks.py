@@ -168,6 +168,28 @@ def bulk_upsert_stocks(stocks: list[dict]) -> int:
     return after - before
 
 
+def set_earnings(dates: dict[str, tuple[str, str | None]]) -> int:
+    """Replace every stored earnings date with this sweep's results.
+
+    Cleared first rather than merged: a company that moves its report out of
+    the scanned window sends no signal saying the old date is wrong, so a
+    merge would serve it until it passed. Both statements share one
+    transaction, so a reader never sees the gap.
+    """
+    with get_connection() as conn:
+        conn.execute("UPDATE stocks SET next_earnings_date = NULL, "
+                     "next_earnings_time = NULL "
+                     "WHERE next_earnings_date IS NOT NULL")
+        if not dates:
+            return 0
+        return executemany(
+            conn,
+            "UPDATE stocks SET next_earnings_date = %s, next_earnings_time = %s "
+            "WHERE short_name = %s",
+            [(date, when, short_name) for short_name, (date, when) in dates.items()],
+        )
+
+
 def upsert_stock(short_name: str, name: str, type: str = "STOCK", currency_code: str | None = None) -> None:
     """Used when a symbol is followed that isn't in the catalogue yet."""
     with get_connection() as conn:

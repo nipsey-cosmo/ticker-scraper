@@ -286,6 +286,12 @@ ALTER TABLE prices ADD COLUMN IF NOT EXISTS open   DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS high   DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS low    DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS volume BIGINT;
+
+-- The next earnings date, and which side of the bell it lands on. Two
+-- columns rather than a table: at most one date per stock is ever wanted,
+-- and past ones are filtered on read rather than kept as history.
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_date DATE;
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_time TEXT;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for

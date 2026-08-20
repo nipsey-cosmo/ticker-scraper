@@ -264,7 +264,8 @@ class TestQuotes:
                               "sector": None, "industry": None,
                               "currencyCode": None, "exchange": None,
                               "yahooSymbol": None, "price": None, "change": None,
-                              "changePercent": None, "priceUpdatedAt": None}
+                              "changePercent": None, "priceUpdatedAt": None,
+                              "nextEarningsDate": None, "nextEarningsTime": None}
 
     def test_duplicates_are_collapsed(self, client):
         results = client.get("/stocks/quotes?symbols=AAPL,AAPL").json()["results"]
@@ -763,3 +764,172 @@ class TestRefresh:
         monkeypatch.setattr(system_routes.jobs, "refresh_all", lambda: calls.append(1))
         assert client.post("/refresh").status_code == 202
         assert calls == [1]
+
+
+# Trimmed from a live pull. `time` is Nasdaq's marker; a day with no earnings
+# answers 200 with a null `rows`, which is not a failure.
+EARNINGS_DAY = {
+    "data": {
+        "asOf": "Thu, Aug 20, 2026",
+        "rows": [
+            {"symbol": "WMT", "name": "Walmart Inc.", "time": "time-pre-market",
+             "epsForecast": "$0.73", "marketCap": "$909,608,447,417"},
+            {"symbol": "AAPL", "name": "Apple Inc.", "time": "time-after-hours",
+             "epsForecast": "$1.60", "marketCap": "$3,000,000,000,000"},
+            {"symbol": "ZZZZ", "name": "Not Followed Inc.", "time": "time-not-supplied",
+             "epsForecast": "$0.01", "marketCap": "$1"},
+        ],
+    },
+    "message": None,
+    "status": {"rCode": 200},
+}
+EMPTY_DAY = {"data": {"asOf": "Sat, Aug 22, 2026", "rows": None},
+             "message": None, "status": {"rCode": 200}}
+
+
+class TestEarningsCalendarParse:
+    def test_the_side_of_the_bell_is_kept(self):
+        """"Reports Thursday" is useless without it: pre-market gaps Thursday's
+        open, after-hours makes Friday's open the one that moves."""
+        from services import calendar
+        assert calendar.parse(EARNINGS_DAY) == {
+            "WMT": "pre", "AAPL": "post", "ZZZZ": None}
+
+    def test_a_day_with_no_earnings_is_not_a_failure(self):
+        """Most Saturdays would otherwise look exactly like a broken scraper."""
+        from services import calendar
+        assert calendar.parse(EMPTY_DAY) == {}
+        assert calendar.parse({}) == {}
+
+
+class TestEarningsCalendarSweep:
+    @staticmethod
+    def _stub(monkeypatch, by_date):
+        from services import calendar
+        seen = []
+
+        def fake_fetch(date):
+            seen.append(date)
+            return calendar.parse(by_date.get(date, EMPTY_DAY))
+
+        monkeypatch.setattr(calendar, "fetch_day", fake_fetch)
+        return seen
+
+    def test_a_us_listing_gets_its_next_date(self, stocked_db, monkeypatch):
+        import db
+        from services import calendar
+        from normalize import now_utc
+
+        today = now_utc().date().isoformat()
+        self._stub(monkeypatch, {today: EARNINGS_DAY})
+
+        assert calendar.refresh_watchlist() == 1
+        row = db.stocks.get_stock("AAPL")
+        assert str(row["next_earnings_date"]) == today
+        assert row["next_earnings_time"] == "post"
+
+    def test_a_non_us_listing_stores_nothing(self, stocked_db, monkeypatch):
+        """Nasdaq's calendar is US-only. A London listing gets a null, which is
+        not the same as a failed lookup."""
+        import db
+        from services import calendar
+        from normalize import now_utc
+
+        db.watchlist.add("SHEL")
+        db.stocks.set_resolution("SHEL", "SHEL.L", "LSE", "GBP")
+        self._stub(monkeypatch, {now_utc().date().isoformat(): EARNINGS_DAY})
+
+        calendar.refresh_watchlist()
+        assert db.stocks.get_stock("SHEL")["next_earnings_date"] is None
+
+    def test_the_first_matching_day_wins(self, stocked_db, monkeypatch):
+        """The window is scanned forward, so the first hit is the next date and
+        not an arbitrary one."""
+        import db
+        from datetime import timedelta
+
+        from services import calendar
+        from normalize import now_utc
+
+        today = now_utc().date()
+        soon = (today + timedelta(days=3)).isoformat()
+        later = (today + timedelta(days=9)).isoformat()
+        self._stub(monkeypatch, {soon: EARNINGS_DAY, later: EARNINGS_DAY})
+
+        calendar.refresh_watchlist()
+        assert str(db.stocks.get_stock("AAPL")["next_earnings_date"]) == soon
+
+    def test_a_date_that_moved_out_of_the_window_is_dropped(self, stocked_db, monkeypatch):
+        """Nothing says "that date is no longer true", so a merge would serve
+        the stale one until it passed."""
+        import db
+        from services import calendar
+        from normalize import now_utc
+
+        self._stub(monkeypatch, {now_utc().date().isoformat(): EARNINGS_DAY})
+        calendar.refresh_watchlist()
+        assert db.stocks.get_stock("AAPL")["next_earnings_date"] is not None
+
+        self._stub(monkeypatch, {})
+        calendar.refresh_watchlist()
+        assert db.stocks.get_stock("AAPL")["next_earnings_date"] is None
+
+    def test_the_sweep_is_one_request_per_day_scanned(self, stocked_db, monkeypatch):
+        from services import calendar
+        seen = self._stub(monkeypatch, {})
+        calendar.refresh_watchlist()
+        assert len(seen) == calendar._DAYS_AHEAD
+
+
+class TestEarningsOnTheApi:
+    def test_an_upcoming_date_is_served_with_its_marker(self, client):
+        import db
+        from datetime import timedelta
+
+        from normalize import now_utc
+
+        when = (now_utc().date() + timedelta(days=4)).isoformat()
+        db.stocks.set_earnings({"AAPL": (when, "pre")})
+
+        body = client.get("/stocks/AAPL").json()
+        assert body["nextEarningsDate"] == when
+        assert body["nextEarningsTime"] == "pre"
+
+    def test_a_date_that_has_passed_is_not_served_as_upcoming(self, client):
+        """The sweep rewrites these daily, but between runs a date falls into
+        the past and "reports on Tuesday" becomes a lie."""
+        import db
+        from datetime import timedelta
+
+        from normalize import now_utc
+
+        gone = (now_utc().date() - timedelta(days=1)).isoformat()
+        db.stocks.set_earnings({"AAPL": (gone, "pre")})
+
+        body = client.get("/stocks/AAPL").json()
+        assert body["nextEarningsDate"] is None
+
+    def test_a_stock_with_no_date_serves_null(self, client):
+        assert client.get("/stocks/AAPL").json()["nextEarningsDate"] is None
+
+
+class TestEarningsInTheEventPrompt:
+    def test_the_date_is_given_to_the_model_as_context(self, stocked_db):
+        """"Reports in three days" is something the model currently has to
+        infer from headlines, and mostly cannot."""
+        from datetime import timedelta
+
+        import db
+        from normalize import now_utc
+        from services import events
+
+        when = (now_utc().date() + timedelta(days=3)).isoformat()
+        db.stocks.set_earnings({"AAPL": (when, "post")})
+
+        prompt = events._build_prompt("AAPL", [], [])
+        assert f"reports earnings on {when}" in prompt
+        assert "after the close" in prompt
+
+    def test_no_date_adds_nothing_to_the_prompt(self, stocked_db):
+        from services import events
+        assert "UPCOMING" not in events._build_prompt("AAPL", [], [])

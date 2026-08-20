@@ -395,7 +395,33 @@ row intact and that a Google-redirect URL is skipped without a fetch.
 
 ### 2.4 — B5 · Earnings calendar
 
-- [ ] `feat: track earnings dates, the one market-moving date you can see coming`
+- [x] `feat: track earnings dates, the one market-moving date you can see coming`
+
+**Done, two columns not a table.** At most one date per stock is ever wanted
+and past ones are filtered on read, so `stocks.next_earnings_date` and
+`next_earnings_time` in `_ALTERS` beat a table plus a db module plus a join.
+
+`set_earnings` **clears every date before writing**, in one transaction.
+Merging would have been wrong: a company that moves its report out of the
+14-day window sends no signal saying the old date is false, so the stale one
+would be served until it passed. Rewriting the whole set is the only version
+that cannot go stale.
+
+The API filters again on read (`_upcoming_earnings`) because the sweep is
+daily and a date falls into the past between runs - at which point "reports
+on Tuesday" is a lie rather than merely old.
+
+The join to Nasdaq's unsuffixed US symbols goes through the resolved
+`yahoo_symbol`, gated on `is_us_listing`, so a London listing is never even
+looked up. Scanned forward day by day, so the first hit is genuinely the
+*next* date.
+
+A day with no earnings answers 200 with `rows: null`. That is most Saturdays,
+and untreated it looks exactly like a broken scraper.
+
+`services/calendar.py` shadows a stdlib module name by file name only -
+absolute imports mean `import calendar` still finds stdlib, and nothing under
+`services/` imports it.
 
 **Files** `backend/services/calendar.py` (new), `backend/db/connection.py`,
 `backend/jobs.py`, `backend/scheduler.py`, `backend/routes/stocks.py`,

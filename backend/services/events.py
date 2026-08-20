@@ -30,7 +30,7 @@ from uuid import UUID
 import db
 from normalize import days_ago_iso
 
-from . import ai_service
+from . import ai_service, calendar
 
 # Impact is a coarse tier on purpose. A confidence score or a "≈4% of quarterly
 # revenue" materiality estimate would be fake precision: we have headlines, not
@@ -191,6 +191,14 @@ def _build_prompt(short_name: str, new_articles: list[dict],
     events = db.events.recent_events(short_name, days=_PRIOR_DAYS)
 
     parts = [f"Stock: {short_name}", ""]
+
+    # The one thing the model cannot infer from headlines. Without it,
+    # "reports in three days" has to be guessed from coverage.
+    upcoming = calendar.next_for(short_name)
+    if upcoming:
+        side = {"pre": " before the open", "post": " after the close"}
+        parts += [f"UPCOMING: reports earnings on {upcoming['date']}"
+                  f"{side.get(upcoming['when'], '')}.", ""]
 
     parts.append(f"PRIOR COVERAGE (last {_PRIOR_DAYS} days, already known):")
     parts.append("\n".join(f"- {h}" for h in prior) if prior
