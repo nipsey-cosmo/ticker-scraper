@@ -281,7 +281,36 @@ call event detection.
 
 ### 2.2 — B2 · Newswire ingestion
 
-- [ ] `feat: read the newswires, where company announcements land first`
+- [x] `feat: read the newswires, where company announcements land first`
+
+**Done, three feeds not four.** ACCESS Newswire's RSS returns a flat 403 to
+both curl and the app's scraper - a WAF at the handshake, which is exactly
+what **3.4** exists to fix. Add it there; it is the smallest of the four.
+GlobeNewswire 403s a plain curl but answers the scraper's rotated fingerprint
+fine, so it stayed.
+
+**Half of Business Wire's home feed is translations.** A live pull was 19
+English items of 39; the rest were the same releases in Arabic, Japanese,
+French and six other languages. They carry the ticker so relevance keeps them,
+and dedup compares token overlap, which cannot match Arabic to English - a
+holder would have seen one announcement five times. Both wires that translate
+put the language in the URL path, so `_is_english` catches it there. This was
+not in the audit and would have been a visible bug on day one.
+
+The single fetch is a module-level cache on `wires.fetch()` with a TTL of
+`NEWS_FAST_MINUTES`, so a sweep pulls once and the whole watchlist reads it.
+`for_stock` narrows the firehose with `dedup.is_relevant` - the same check
+every other source is held to - rather than passing a few hundred items per
+stock to `prepare`, which would have made 1.5's per-source yield meaningless.
+
+Business Wire attaches the release image as an RSS enclosure, so wire items
+land with an image and skip the Open Graph fetch entirely.
+
+`yahoo_news._clean_summary` is now `clean_summary`: PR Newswire bodies are
+HTML and it already did exactly the right thing.
+
+Two old tests started making live requests the moment a non-US-gated source
+appeared - the 1.4 lesson again. `_quiet` now stubs `wires.for_stock`.
 
 **Files** `backend/services/news/wires.py` (new),
 `backend/services/news/__init__.py`, `backend/tests/test_news_parsers.py`

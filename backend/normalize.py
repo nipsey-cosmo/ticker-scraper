@@ -260,6 +260,8 @@ def title_key(title: str) -> str:
 _SOURCE_RANK: dict[str, int] = {
     # The filing outranks everyone reporting on the filing.
     "sec.gov": 0,
+    # ...and the company's own release outranks everyone rewriting it.
+    "globenewswire.com": 0, "businesswire.com": 0, "prnewswire.com": 0,
     "reuters.com": 0, "bloomberg.com": 0, "ft.com": 0, "wsj.com": 0,
     "apnews.com": 1, "cnbc.com": 1, "barrons.com": 1, "economist.com": 1,
     "marketwatch.com": 2, "nytimes.com": 2, "theguardian.com": 2, "bbc.co.uk": 2,

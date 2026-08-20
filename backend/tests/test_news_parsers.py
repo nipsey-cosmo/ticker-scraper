@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.news import finviz, google_news, images, publishers, yahoo_news
+from services.news import finviz, google_news, images, publishers, wires, yahoo_news
 
 GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -156,7 +156,7 @@ class TestYahooThumbnails:
         assert yahoo_news._best_thumbnail(thumbnail) is None
 
     def test_html_in_a_summary_is_stripped(self):
-        assert yahoo_news._clean_summary("<p>Apple <b>beat</b> estimates</p>") == \
+        assert yahoo_news.clean_summary("<p>Apple <b>beat</b> estimates</p>") == \
             "Apple beat estimates"
 
 
@@ -208,3 +208,146 @@ class TestImageExtraction:
 
     def test_page_with_no_usable_image(self):
         assert images.extract_image("<html><body><p>text</p></body></html>", "https://x.com") is None
+
+
+# Trimmed from live pulls of all three wires. The Arabic item is the trap:
+# Business Wire's home feed carries every release in up to ten languages, they
+# all name the ticker, and token overlap cannot match Arabic to English.
+WIRE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>Business Wire News</title>
+<item>
+  <title>Rocket Lab Awarded USD 515 Million Space Force Contract</title>
+  <pubDate>Thu, 20 Aug 2026 20:50:00 UT</pubDate>
+  <enclosure url="https://mms.businesswire.com/media/20260820007198/en/neutron.jpg"
+             type="image/jpeg" length="2048"/>
+  <description>LONG BEACH, Calif.--(BUSINESS WIRE)--&lt;p&gt;Rocket Lab (NASDAQ: RKLB)
+    today announced it has been awarded a contract.&lt;/p&gt;</description>
+  <link>http://www.businesswire.com/news/home/20260820007198/en/Rocket-Lab-Awarded</link>
+</item>
+<item>
+  <title>Rocket Lab remporte un contrat de 515 millions de dollars</title>
+  <pubDate>Thu, 20 Aug 2026 20:50:00 UT</pubDate>
+  <description>LONG BEACH--(BUSINESS WIRE)--Rocket Lab (NASDAQ: RKLB) a annonce.</description>
+  <link>http://www.businesswire.com/news/home/20260820007198/fr/?feedref=JjAwJuNHiyst</link>
+</item>
+<item>
+  <title>Vitalist Reports First Quarter 2027 Financial Results</title>
+  <pubDate>Thu, 20 Aug 2026 21:05 GMT</pubDate>
+  <description><![CDATA[Vitalist Reports First Quarter 2027 Financial Results]]></description>
+  <link>https://www.globenewswire.com/news-release/2026/08/20/3348846/0/en/vitalist-q1.html</link>
+</item>
+<item>
+  <title></title>
+  <link>https://www.prnewswire.com/news-releases/untitled-302345.html</link>
+</item>
+</channel></rss>"""
+
+
+class TestWireParse:
+    def test_translations_are_dropped(self):
+        """Half of Business Wire's home feed is the same releases in other
+        languages. They name the ticker so relevance keeps them, and dedup
+        compares token overlap, which cannot match French to English."""
+        titles = [a["title"] for a in wires.parse(WIRE_RSS, "Business Wire")]
+        assert "Rocket Lab Awarded USD 515 Million Space Force Contract" in titles
+        assert not any("remporte" in t for t in titles)
+
+    def test_a_feed_with_no_language_segment_is_not_treated_as_a_translation(self):
+        """PR Newswire URLs carry no language at all, which is not the same as
+        carrying a foreign one."""
+        assert wires._is_english(
+            "https://www.prnewswire.com/news-releases/some-slug-302345.html")
+
+    def test_untitled_items_are_skipped(self):
+        assert len(wires.parse(WIRE_RSS, "PR Newswire")) == 2
+
+    def test_the_release_image_is_taken_from_the_enclosure(self):
+        """Already in hand, and it saves the Open Graph fetch images.py would
+        otherwise make for this article."""
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert article["image"] == \
+            "https://mms.businesswire.com/media/20260820007198/en/neutron.jpg"
+
+    def test_html_is_stripped_from_the_release_body(self):
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert "<p>" not in article["description"]
+        assert "NASDAQ: RKLB" in article["description"]
+
+    def test_domain_and_date_survive(self):
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert article["source_domain"] == "businesswire.com"
+        assert article["published_at"].date().isoformat() == "2026-08-20"
+        assert article["source_type"] == "WIRES"
+
+    def test_the_release_outranks_the_write_up_of_it(self):
+        """A rewrite should never win a dedup tie-break against the company's
+        own words."""
+        from normalize import source_rank
+        assert source_rank("businesswire.com") < source_rank("fool.com")
+        assert source_rank("globenewswire.com") < source_rank("benzinga.com")
+
+    def test_an_unnamed_wire_item_is_never_sector_context(self):
+        """Finviz's per-ticker table earns `related`; a firehose does not. An
+        unnamed wire item is simply another company's announcement."""
+        from services.dedup import _RELATED_ALLOWED
+        assert wires.SOURCE_TYPE not in _RELATED_ALLOWED
+
+
+class TestWireFanOut:
+    """The feeds are not per-ticker: one pull covers the whole watchlist."""
+
+    @staticmethod
+    def _stub(monkeypatch, calls):
+        from types import SimpleNamespace
+        wires.reset_cache()
+        monkeypatch.setattr(wires, "_cache", None, raising=False)
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return SimpleNamespace(status=200, ok=True, text=WIRE_RSS)
+
+        monkeypatch.setattr(wires.scraper, "get", fake_get)
+
+    def test_one_pull_serves_every_stock(self, monkeypatch):
+        calls = []
+        self._stub(monkeypatch, calls)
+
+        for short_name in ("RKLB", "AAPL", "TSLA", "SHEL", "VITA"):
+            wires.for_stock(short_name, short_name)
+
+        assert len(calls) == len(wires._FEEDS)
+        wires.reset_cache()
+
+    def test_an_item_naming_the_company_is_kept_and_the_rest_dropped(self, monkeypatch):
+        calls = []
+        self._stub(monkeypatch, calls)
+
+        kept = wires.for_stock("6RJ0", "Rocket Lab Corp", aliases=("RKLB",))
+        assert [a["title"] for a in kept] == [
+            "Rocket Lab Awarded USD 515 Million Space Force Contract"] * len(wires._FEEDS)
+
+        assert wires.for_stock("AAPL", "Apple Inc.") == []
+        wires.reset_cache()
+
+    def test_a_failing_feed_does_not_take_the_others_down(self, monkeypatch):
+        from types import SimpleNamespace
+        wires.reset_cache()
+        seen = []
+
+        def fake_get(url, **kwargs):
+            seen.append(url)
+            if "globenewswire" in url:
+                return None
+            return SimpleNamespace(status=200, ok=True, text=WIRE_RSS)
+
+        monkeypatch.setattr(wires.scraper, "get", fake_get)
+        assert len(wires.fetch()) == 2 * (len(wires._FEEDS) - 1)
+        assert len(seen) == len(wires._FEEDS)
+        wires.reset_cache()
+
+    def test_wires_ride_the_fast_lane(self):
+        """They carry the announcement itself, so waiting an hour for it
+        defeats the point."""
+        from services import news as news_pkg
+        assert wires.SOURCE_TYPE in news_pkg.FAST_SOURCES

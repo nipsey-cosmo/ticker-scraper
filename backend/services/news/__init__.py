@@ -4,6 +4,7 @@ Seven fetches across five independent operators, so no single company's outage
 or rate limit can take the feed down:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
+    Newswires     the company's own release, which every article rewrites
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
     Yahoo RSS     summaries
@@ -38,15 +39,17 @@ import settings
 from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
-from . import bing_news, finviz, google_news, images, nasdaq_news, sec_edgar, yahoo_news
+from . import (bing_news, finviz, google_news, images, nasdaq_news, sec_edgar,
+               wires, yahoo_news)
 
 __all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
            "FAST_SOURCES"]
 
-# The two-minute lane. Filings are the only source where minutes matter:
-# an 8-K lands here before anybody has written about it. Everything else
-# is somebody's write-up and can wait for the hour.
-FAST_SOURCES = frozenset({sec_edgar.SOURCE_TYPE})
+# The two-minute lane: the two sources that carry the announcement itself
+# rather than somebody's write-up of it. Both are minutes ahead of the rest,
+# and both are cheap — a filing check is one JSON body, and the wires are one
+# shared pull for the whole watchlist.
+FAST_SOURCES = frozenset({sec_edgar.SOURCE_TYPE, wires.SOURCE_TYPE})
 
 
 def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
@@ -75,6 +78,12 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
     tasks.append((yahoo_news.RSS_TYPE, lambda: yahoo_news.fetch_rss(ticker)))
     tasks.append((bing_news.SOURCE_TYPE,
                   lambda: bing_news.fetch(short_name, company_name, days=days)))
+
+    # Not per-ticker and not US-only: one pull of the firehose serves every
+    # stock, and the wires carry European issuers the US sources never see.
+    tasks.append((wires.SOURCE_TYPE,
+                  lambda: wires.for_stock(short_name, company_name,
+                                          _alias_tuple(yahoo_symbol))))
 
     # Finviz, Nasdaq and EDGAR only carry US listings.
     if symbols.is_us_listing(exchange):
@@ -134,7 +143,11 @@ def _aliases(stock: dict) -> tuple[str, ...]:
 
     Trading212 calls Rocket Lab `6RJ0`; every article calls it `RKLB`.
     """
-    resolved = stock.get("yahoo_symbol") or ""
+    return _alias_tuple(stock.get("yahoo_symbol"))
+
+
+def _alias_tuple(yahoo_symbol: str | None) -> tuple[str, ...]:
+    resolved = yahoo_symbol or ""
     aliases = {resolved, resolved.split(".")[0]}
     return tuple(a for a in aliases if a)
 

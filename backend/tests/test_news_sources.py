@@ -297,6 +297,7 @@ class TestCollectionAccounting:
             (news_pkg.finviz, ("fetch",)),
             (news_pkg.nasdaq_news, ("fetch",)),
             (news_pkg.sec_edgar, ("fetch",)),
+            (news_pkg.wires, ("for_stock",)),
         ):
             for name in names:
                 monkeypatch.setattr(module, name, lambda *a, **kw: [])
@@ -311,7 +312,7 @@ class TestCollectionAccounting:
 
         rows = {r["source_type"]: r for r in db.sources.yields()}
         assert set(rows) == {"GOOGLE_NEWS", "YAHOO_SEARCH", "YAHOO_RSS",
-                             "BING_NEWS", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
+                             "BING_NEWS", "WIRES", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
         assert all(r["fetches"] == 1 and r["skips"] == 0 for r in rows.values())
 
     def test_a_london_listing_records_the_us_sources_as_skipped(self, temp_db, monkeypatch):
@@ -371,7 +372,7 @@ class TestFastLane:
         news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS",
                          only=news_pkg.FAST_SOURCES)
 
-        assert {r["source_type"] for r in db.sources.yields()} == {"SEC_EDGAR"}
+        assert {r["source_type"] for r in db.sources.yields()} == {"SEC_EDGAR", "WIRES"}
 
     def test_a_source_outside_the_lane_is_not_recorded_as_skipped(self, temp_db, monkeypatch):
         """Not its turn is not the same as unavailable. Recording it as a skip
@@ -386,8 +387,11 @@ class TestFastLane:
                          only=news_pkg.FAST_SOURCES)
 
         rows = {r["source_type"]: r for r in db.sources.yields()}
-        assert set(rows) == {"SEC_EDGAR"}
+        assert set(rows) == {"SEC_EDGAR", "WIRES"}
         assert rows["SEC_EDGAR"]["skips"] == 1
+        # The wires are not US-gated: a London listing is exactly what they
+        # cover that Finviz, Nasdaq and EDGAR never will.
+        assert rows["WIRES"]["fetches"] == 1
 
     def test_the_fast_lane_does_not_run_event_detection(self, stocked_db, monkeypatch):
         """It is an LLM call per batch. Every two minutes across the watchlist
@@ -396,6 +400,7 @@ class TestFastLane:
         from services import news as news_pkg
 
         monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+        monkeypatch.setattr(news_pkg.wires, "for_stock", lambda *a, **kw: [])
         monkeypatch.setattr(
             news_pkg.sec_edgar, "fetch",
             lambda *a, **kw: sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc."))

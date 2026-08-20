@@ -76,7 +76,7 @@ def fetch_rss(symbol: str) -> list[dict]:
             "title": title,
             "url": link,
             "published_at": parse_datetime(entry.get("published") or entry.get("updated")),
-            "description": _clean_summary(summary),
+            "description": clean_summary(summary),
             "image": None,
             "source": _publisher_from_domain(domain),
             "source_domain": domain,
@@ -86,7 +86,7 @@ def fetch_rss(symbol: str) -> list[dict]:
     return articles
 
 
-def _clean_summary(summary: str | None) -> str | None:
+def clean_summary(summary: str | None) -> str | None:
     if not summary:
         return None
     from bs4 import BeautifulSoup
