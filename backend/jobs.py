@@ -11,7 +11,7 @@ import time
 import db
 import settings
 from normalize import days_ago_iso, markets_open
-from services import calendar, news, prices, sentiment_service
+from services import calendar, news, prices, sentiment_service, social
 
 # One backfill per symbol at a time. Adding a stock twice in quick succession
 # would otherwise fan out two identical month-long scrapes.
@@ -75,6 +75,11 @@ def refresh_earnings() -> dict:
     to gain from running it more often — a date does not move hourly.
     """
     return {"updated": calendar.refresh_watchlist()}
+
+
+def refresh_social() -> dict:
+    """Hourly. One call for the whole ranked table, joined to the watchlist."""
+    return {"updated": social.refresh_watchlist()}
 
 
 def prune() -> dict:
@@ -143,4 +148,5 @@ def refresh_all() -> dict:
         "news": refresh_news(),
         "sentiment_days": aggregate_sentiment(),
         "earnings": refresh_earnings(),
+        "social": refresh_social(),
     }

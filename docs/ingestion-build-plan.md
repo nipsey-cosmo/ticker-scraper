@@ -444,7 +444,29 @@ that a stale past date is not served as upcoming.
 
 ### 2.5 — B4 · Retail mention velocity
 
-- [ ] `feat: track retail mention velocity as its own signal`
+- [x] `feat: track retail mention velocity as its own signal`
+
+**Done.** Two columns on `stocks` again (`social_mentions`,
+`social_mentions_prev`), and `set_social` clears before it writes for the same
+reason `set_earnings` does: falling out of the ranked table means the stock
+has gone *quiet*, and keeping the old count would report the exact opposite.
+
+The delta is computed on read, not stored, so there is one source of truth for
+it. The level is served alongside it because 61 mentions up from 44 and 3 up
+from 1 are not the same story.
+
+Matching goes through the resolved `yahoo_symbol` first and the local
+`short_name` second - Trading212 calls Rocket Lab `6RJ0` and Reddit calls it
+`RKLB`, so the plan's `short_name.split(".")[0]` alone would have missed it.
+Only the top hundred are ranked, and a stock outside them genuinely has no
+chatter; that absence is the right answer, not a miss.
+
+**Unrelated pre-existing bug fixed to get green:** `db.graphs.article_scores`
+ordered by `publish_time` with no unique tiebreaker, so three articles sharing
+a timestamp came back in a different order between runs and flipped
+`test_scores_land_in_the_right_bucket`. It reproduces on 2.4's tip with this
+sub-point stashed, so it is not from this work. One line: `ORDER BY
+publish_time, id`, which is the convention `backend/CLAUDE.md` already states.
 
 **Files** `backend/services/social.py` (new), `backend/db/connection.py`,
 `backend/jobs.py`, `backend/routes/stocks.py`, `backend/tests/test_api.py`

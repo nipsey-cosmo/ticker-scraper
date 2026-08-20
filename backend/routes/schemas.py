@@ -33,6 +33,10 @@ class Stock(BaseModel):
     # non-US listing, which is a null rather than a failure.
     nextEarningsDate: Optional[str] = None
     nextEarningsTime: Optional[str] = None
+    # Reddit mentions now, and the 24h change. A separate signal from
+    # sentiment: loudness and tone are different axes.
+    socialMentions: Optional[int] = None
+    socialMentionsChange: Optional[int] = None
 
 
 class StockList(BaseModel):
@@ -260,7 +264,16 @@ def to_stock(row: dict) -> Stock:
         changePercent=row.get("price_change_percent"),
         priceUpdatedAt=row.get("price_updated_at"),
         **_upcoming_earnings(row),
+        socialMentions=row.get("social_mentions"),
+        socialMentionsChange=_mention_change(row),
     )
+
+
+def _mention_change(row: dict) -> int | None:
+    """The delta is the signal. A stock is always mentioned somewhat, and
+    the level mostly measures market cap."""
+    now, before = row.get("social_mentions"), row.get("social_mentions_prev")
+    return None if now is None or before is None else now - before
 
 
 def _upcoming_earnings(row: dict) -> dict:

@@ -190,6 +190,27 @@ def set_earnings(dates: dict[str, tuple[str, str | None]]) -> int:
         )
 
 
+def set_social(counts: dict[str, tuple[int | None, int | None]]) -> int:
+    """Replace every stored mention count with this sweep's results.
+
+    Cleared first for the same reason earnings dates are: a stock that drops
+    out of the ranked table has gone quiet, and keeping the old count would
+    report the exact opposite.
+    """
+    with get_connection() as conn:
+        conn.execute("UPDATE stocks SET social_mentions = NULL, "
+                     "social_mentions_prev = NULL "
+                     "WHERE social_mentions IS NOT NULL")
+        if not counts:
+            return 0
+        return executemany(
+            conn,
+            "UPDATE stocks SET social_mentions = %s, social_mentions_prev = %s "
+            "WHERE short_name = %s",
+            [(now, prev, short_name) for short_name, (now, prev) in counts.items()],
+        )
+
+
 def upsert_stock(short_name: str, name: str, type: str = "STOCK", currency_code: str | None = None) -> None:
     """Used when a symbol is followed that isn't in the catalogue yet."""
     with get_connection() as conn:

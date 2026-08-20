@@ -43,6 +43,14 @@ scheduler.add_job(jobs.prune, "cron", hour=3, minute=30, id="prune")
 # stock before anyone looks at it.
 scheduler.add_job(jobs.refresh_earnings, "cron", hour=9, minute=0, id="earnings")
 
+# Mention velocity moves over hours, and one call covers the whole
+# watchlist, so it rides the same cadence as the news lane.
+scheduler.add_job(
+    jobs.refresh_social, "interval",
+    minutes=settings.NEWS_REFRESH_MINUTES, id="social",
+    max_instances=1, coalesce=True,
+)
+
 # No catalogue job: instruments arrive from Yahoo search when one is followed
 # (see routes/watchlist.py), so there is nothing to bulk refresh.
 
@@ -60,6 +68,7 @@ def main() -> None:
     jobs.refresh_news()
     jobs.aggregate_sentiment()
     jobs.refresh_earnings()
+    jobs.refresh_social()
 
     try:
         scheduler.start()

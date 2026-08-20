@@ -292,6 +292,12 @@ ALTER TABLE prices ADD COLUMN IF NOT EXISTS volume BIGINT;
 -- and past ones are filtered on read rather than kept as history.
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_date DATE;
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_time TEXT;
+
+-- Reddit mention counts, now and 24h ago. Deliberately its own pair of
+-- columns and never folded into `sentiment`: how loud a stock is and how
+-- well it reads are different axes, and averaging them destroys both.
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions      INT;
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions_prev INT;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for

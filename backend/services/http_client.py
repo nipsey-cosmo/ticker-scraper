@@ -118,6 +118,8 @@ _HOST_RATES: dict[str, tuple[float, float]] = {
     # deliberately: it is a fallback, so it only runs when something else has
     # already failed, and it never needs to be fast.
     "stooq.com": (0.5, 2.0),
+    # One call an hour for the whole watchlist. It never needs headroom.
+    "apewisdom.io": (0.5, 2.0),
 }
 _DEFAULT_RATE = (1.5, 4.0)
 _MIN_RATE = 0.2
