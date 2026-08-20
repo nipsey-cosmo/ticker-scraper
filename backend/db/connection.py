@@ -275,6 +275,10 @@ $fn$ LANGUAGE plpgsql;
 _ALTERS = """
 ALTER TABLE news   ADD COLUMN IF NOT EXISTS impact TEXT;
 
+-- The article text. Nothing read an article before this: sentiment and the
+-- event prompt both ran on a headline and whatever teaser the feed gave.
+ALTER TABLE news   ADD COLUMN IF NOT EXISTS body   TEXT;
+
 -- Yahoo returns the full bar in the same payload as the close; storing only
 -- `close` meant no candlesticks and, worse, no volume — which is the number
 -- that says whether a headline actually mattered.

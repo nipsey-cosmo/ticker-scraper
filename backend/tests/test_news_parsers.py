@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from services.news import finviz, google_news, images, publishers, wires, yahoo_news
+from services.news import (extract, finviz, google_news, images, publishers,
+                          wires, yahoo_news)
 
 GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -351,3 +352,182 @@ class TestWireFanOut:
         defeats the point."""
         from services import news as news_pkg
         assert wires.SOURCE_TYPE in news_pkg.FAST_SOURCES
+
+
+ARTICLE_HTML = """<html><head><title>Rocket Lab wins contract</title></head><body>
+<nav><a href="/">Home</a><a href="/markets">Markets</a></nav>
+<article><h1>Rocket Lab wins USD 515 million Space Force contract</h1>
+<p>Rocket Lab said on Thursday it had been awarded a contract worth up to 515
+million dollars by the United States Space Force, the largest single award in
+the company history and one that management said would underpin revenue growth
+into 2028.</p>
+<p>The company will supply Neutron launch services under the agreement, with the
+first mission scheduled for the second half of next year. Shares rose 9 percent
+in after-hours trading.</p>
+</article>
+<aside><h2>Related</h2><ul><li>Cookie policy</li><li>Sign up for our newsletter</li></ul></aside>
+</body></html>"""
+
+
+class TestBodyExtraction:
+    def test_the_article_survives_and_the_furniture_does_not(self):
+        body = extract.extract_body(ARTICLE_HTML, "https://example.com/a")
+        assert "Space Force" in body and "515" in body
+        assert "Cookie policy" not in body
+        assert "Markets" not in body
+
+    def test_a_consent_wall_is_not_an_article(self):
+        """trafilatura falls back to the raw text of whatever it is given, so a
+        stub page comes back looking like a successful extraction. Scored as
+        sentiment, that is worse than having no body at all."""
+        assert extract.extract_body(
+            "<html><body><p>403 Forbidden</p></body></html>", "https://x.com/a") is None
+        assert extract.extract_body(
+            "<html><body><p>Please enable JavaScript.</p></body></html>",
+            "https://x.com/a") is None
+
+    def test_a_body_is_capped(self):
+        long_page = ("<html><body><article>"
+                     + "<p>Rocket Lab reported record revenue this quarter. </p>" * 400
+                     + "</article></body></html>")
+        assert len(extract.extract_body(long_page, "https://x.com/a")) == extract._MAX_CHARS
+
+    def test_malformed_input_does_not_raise(self):
+        assert extract.extract_body("", "https://x.com/a") is None
+
+
+class TestBodyBackfill:
+    _n = 0
+
+    @classmethod
+    def _stored(cls, **overrides):
+        """One article already in the table, as it would be after `prepare`."""
+        import db
+        cls._n += 1
+        row = {"short_name": "AAPL", "title": "Rocket Lab wins a launch contract",
+               "title_key": f"k{cls._n}", "url": f"https://example.com/s{cls._n}",
+               "url_hash": f"h{cls._n}", "source": "Reuters",
+               "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
+               "publish_time": "2026-08-20T10:00:00Z"}
+        row.update(overrides)
+        row["url_hash"] = row["url"]
+        return db.news.insert_news_many([row])
+
+    def test_a_failed_extraction_leaves_the_row_intact(self, stocked_db, monkeypatch):
+        """Bodies are best-effort, exactly like images: the article is already
+        stored by the time this runs."""
+        import db
+        from types import SimpleNamespace
+
+        ids = self._stored(url="https://example.com/story-1")
+        monkeypatch.setattr(extract.scraper, "get_many", lambda reqs: [
+            SimpleNamespace(status=200, ok=True, url=r["url"],
+                            headers={"content-type": "text/html"},
+                            text="<html><body><p>nope</p></body></html>")
+            for r in reqs])
+
+        assert extract.fill_bodies(ids) == 0
+        row = db.news.get_news_by_id(ids[0])
+        assert row["body"] is None
+        assert row["title"] and row["url"]
+
+    def test_a_google_redirect_is_skipped_without_a_fetch(self, stocked_db, monkeypatch):
+        """There is no article at a CBMi... address, only a consent page."""
+        ids = self._stored(
+            url="https://news.google.com/rss/articles/CBMilAFBVV95cUxOX2JCTHkt?oc=5",
+            source_domain="news.google.com")
+
+        calls = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: calls.append(reqs) or [])
+
+        assert extract.fill_bodies(ids) == 0
+        assert calls == []
+
+    def test_a_filing_is_skipped_without_a_fetch(self, stocked_db, monkeypatch):
+        """A 10-K is megabytes of XBRL and its useful content is the form
+        type, which sec_edgar already put in the title."""
+        ids = self._stored(
+            url="https://www.sec.gov/Archives/edgar/data/320193/0001/aapl.htm",
+            source_domain="sec.gov")
+
+        calls = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: calls.append(reqs) or [])
+
+        assert extract.fill_bodies(ids) == 0
+        assert calls == []
+
+    def test_a_good_page_is_stored_and_read_by_the_scorer(self, stocked_db, monkeypatch):
+        import db
+        from types import SimpleNamespace
+        from services import sentiment_service
+
+        ids = self._stored(url="https://example.com/story-2",
+                           title="Rocket Lab update", description=None)
+        monkeypatch.setattr(extract.scraper, "get_many", lambda reqs: [
+            SimpleNamespace(status=200, ok=True, url=r["url"],
+                            headers={"content-type": "text/html"}, text=ARTICLE_HTML)
+            for r in reqs])
+
+        assert extract.fill_bodies(ids) == 1
+        row = db.news.get_news_by_id(ids[0])
+        assert "Space Force" in row["body"]
+
+        # The whole point: the scorer now reads the article, not the headline.
+        sentiment_service.score_rows([row])
+        assert db.news.get_news_by_id(ids[0])["sentiment"] == \
+            sentiment_service.score_article(row["title"], row["body"])
+
+    def test_the_cap_bounds_one_refresh(self, stocked_db, monkeypatch):
+        from types import SimpleNamespace
+        ids = []
+        for n in range(6):
+            ids += self._stored(url=f"https://example.com/story-cap-{n}")
+
+        seen = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: seen.append(len(reqs)) or [None] * len(reqs))
+
+        extract.fill_bodies(ids, limit=2)
+        assert seen == [2]
+
+    def test_the_flag_turns_it_off(self, stocked_db, monkeypatch):
+        ids = self._stored(url="https://example.com/story-3")
+        monkeypatch.setattr(extract.settings, "EXTRACT_ARTICLE_BODIES", False)
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: pytest.fail("should not fetch"))
+        assert extract.fill_bodies(ids) == 0
+
+
+class TestBodyReachesTheEventPrompt:
+    def test_the_body_is_preferred_over_the_feed_teaser_and_truncated(self):
+        from services import events
+        article = {
+            "publish_time": "2026-08-20T10:00:00+00:00",
+            "source": "Reuters",
+            "title": "Rocket Lab wins contract",
+            "description": "teaser copy",
+            "body": "REAL BODY. " + "x" * 900,
+        }
+        prompt = events._build_prompt("RKLB", [article], [])
+        assert "REAL BODY." in prompt
+        assert "teaser copy" not in prompt
+        assert "x" * 900 not in prompt
+
+    def test_the_teaser_is_still_used_when_there_is_no_body(self):
+        from services import events
+        article = {
+            "publish_time": "2026-08-20T10:00:00+00:00",
+            "source": "Reuters",
+            "title": "Rocket Lab wins contract",
+            "description": "teaser copy",
+            "body": None,
+        }
+        assert "teaser copy" in events._build_prompt("RKLB", [article], [])
+
+    def test_the_batch_shrank_when_bodies_joined_the_prompt(self):
+        """A body costs roughly twice a description, and a 60-article call
+        already took about a minute."""
+        from services import events
+        assert events._BATCH_SIZE <= 40

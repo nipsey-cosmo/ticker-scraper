@@ -94,6 +94,11 @@ FETCH_ARTICLE_IMAGES = _flag("STOCKY_FETCH_ARTICLE_IMAGES", True)
 # fresh database starts empty and fills up as you follow things.
 SEED_ON_START = _flag("STOCKY_SEED_ON_START", True)
 IMAGE_FETCH_LIMIT = _int("STOCKY_IMAGE_FETCH_LIMIT", 12)       # per stock per refresh
+# Body extraction costs the same one request per article as an image does,
+# and is capped the same way. Small on purpose: it runs before scoring, so
+# the limit is what keeps a refresh from turning into hundreds of fetches.
+EXTRACT_ARTICLE_BODIES = _flag("STOCKY_EXTRACT_ARTICLE_BODIES", True)
+BODY_FETCH_LIMIT = _int("STOCKY_BODY_FETCH_LIMIT", 8)          # per refresh
 
 # ── Sentiment ────────────────────────────────────────────────────────────
 # "vader"   → finance-tuned VADER, no torch, instant (default)

@@ -321,7 +321,8 @@ def score_rows(rows: list[dict]) -> int:
     """Score rows of {id, title, description} and persist. Returns count."""
     if not rows:
         return 0
-    scores = [score_article(r.get("title") or "", r.get("description")) for r in rows]
+    scores = [score_article(r.get("title") or "",
+                            r.get("body") or r.get("description")) for r in rows]
     return db.news.set_sentiment_many({r["id"]: s for r, s in zip(rows, scores)})
 
 

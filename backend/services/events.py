@@ -50,7 +50,10 @@ _PRIOR_LIMIT = 60      # same cap summarise_stock uses
 #
 # Each page is judged independently, so one slow or malformed page costs its
 # own articles a tier and no others.
-_BATCH_SIZE = 60
+# Dropped from 60 when bodies joined the prompt (2.3): a body costs roughly
+# twice a description, so the page shrank to keep the prompt — and the ~57s
+# wall-clock a 60-article call took — where they were.
+_BATCH_SIZE = 40
 _MAX_TOKENS = 900
 
 SYSTEM_PROMPT = (
@@ -200,8 +203,11 @@ def _build_prompt(short_name: str, new_articles: list[dict],
     parts += ["", f"NEW ARTICLES ({len(new_articles)}), numbered:"]
     for n, a in enumerate(new_articles, start=1):
         line = f"{n}. [{a['publish_time'][:10]} · {a.get('source') or '?'}] {a['title']}"
-        if a.get("description"):
-            line += f"\n   {a['description'][:200]}"
+        # The extracted body where there is one, the feed's teaser otherwise.
+        # Truncated hard either way: this is the lead, not the article.
+        blurb = a.get("body") or a.get("description")
+        if blurb:
+            line += f"\n   {blurb[:400]}"
         parts.append(line)
 
     return "\n".join(parts)

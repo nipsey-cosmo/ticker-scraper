@@ -39,8 +39,8 @@ import settings
 from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
-from . import (bing_news, finviz, google_news, images, nasdaq_news, sec_edgar,
-               wires, yahoo_news)
+from . import (bing_news, extract, finviz, google_news, images, nasdaq_news,
+               sec_edgar, wires, yahoo_news)
 
 __all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
            "FAST_SOURCES"]
@@ -181,6 +181,15 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
 
     for news_id, fields in prepared.enrichments.items():
         db.news.update_news(news_id, **fields)
+
+    # Before scoring and before the event pass, so both read the article
+    # instead of its headline. Best-effort, like images: a failed extraction
+    # leaves the row exactly as stored.
+    if inserted_ids:
+        try:
+            extract.fill_bodies(inserted_ids)
+        except Exception as exc:
+            print(f"[extract] {short_name} failed: {type(exc).__name__}: {exc}")
 
     if score and inserted_ids:
         sentiment_service.score_news_ids(inserted_ids)

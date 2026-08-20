@@ -336,7 +336,39 @@ kept and one naming nothing is dropped, and that one fetch covers N stocks.
 
 ### 2.3 — D1 · Article body extraction
 
-- [ ] `feat: extract article text so sentiment sees more than a headline`
+- [x] `feat: extract article text so sentiment sees more than a headline`
+
+**Done, and it runs inside `refresh`, not after it.** The plan said "gated
+exactly like `images.py`", but images runs *after* the watchlist loop - which
+would have put the body in the row after scoring and after the event pass had
+already read the headline. `extract.fill_bodies` sits between
+`insert_news_many` and `score_news_ids` instead, so both consumers see it on
+the same cycle.
+
+It is scoped to **this refresh's inserted ids**, not to every body-less row
+for the stock. Widening it to history would have meant `BODY_FETCH_LIMIT` x
+the watchlist every hour forever, for articles scored and judged long ago -
+which is the "hundreds of fetches" the Watch note forbids. A sweep inserts a
+handful per stock, so a cycle costs tens.
+
+`_MIN_CHARS = 200` is load-bearing and was not in the plan: **trafilatura
+falls back to the raw text of whatever it is handed**, so a consent wall, a
+paywall stub or a bare `403 Forbidden` comes back looking like a successful
+extraction - and would then be scored as that article's sentiment.
+`favor_precision=True` for the same reason.
+
+SEC filing pages are skipped alongside Google's `CBMi...` redirects: a 10-K is
+megabytes of XBRL whose useful content is the form type, already in the title
+`sec_edgar` builds.
+
+`_BATCH_SIZE` 60 -> 40 and the blurb cap 200 -> 400 chars, so the event prompt
+and its ~57s wall-clock stay where they were. `body` is not on the
+`NewsArticle` schema, so the API payload is unchanged - it is scorer input,
+not something the UI shows.
+
+Two more test files were silently reaching the live network once a fetch
+appeared inside `refresh` (`test_events`, `test_llm_optional`). That is three
+times now; recorded in marl.
 
 **Files** `backend/services/news/extract.py` (new),
 `backend/services/news/__init__.py`, `backend/db/connection.py`,
