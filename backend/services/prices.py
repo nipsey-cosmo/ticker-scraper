@@ -277,7 +277,7 @@ def _store(short_name: str, quote: dict) -> None:
         # regardless of which session time the exchange reports.
         db.prices.upsert_points(
             short_name,
-            [(ts[:10] + "T00:00:00Z", close) for ts, close in quote["points"]],
+            [{**bar, "ts": bar["ts"][:10] + "T00:00:00Z"} for bar in quote["points"]],
             interval="1d",
         )
 

@@ -67,7 +67,15 @@ returns the first body, and that the request carried `If-None-Match`.
 
 ### 1.2 — C1 · Store OHLC and volume
 
-- [ ] `feat: store open, high, low and volume, not just the close`
+- [x] `feat: store open, high, low and volume, not just the close`
+
+**Done.** `_ALTERS` now exists in `db/connection.py` as the home for every
+post-ship column (the lone `news.impact` ALTER moved into it), so 1.3 and 3.1
+get their schema changes for one line each. `parse_chart` emits dicts rather
+than `(ts, close)` tuples; `upsert_points` accepts **both** shapes, because 20
+existing call sites genuinely only have a close and making them all build a
+dict would be noise. The update path `COALESCE`s OHLC so a snapshot landing on
+a bar's slot corrects the close without blanking the rest.
 
 **Files** `backend/services/yahoo.py`, `backend/db/prices.py`,
 `backend/db/connection.py`, `backend/services/prices.py`,

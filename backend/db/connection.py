@@ -195,11 +195,6 @@ CREATE TABLE IF NOT EXISTS app_config (
     value TEXT NOT NULL             -- '1' | '0'
 );
 
--- CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a new column
--- on an old database needs its own idempotent statement or the app runs on the
--- old shape while the tests pass.
-ALTER TABLE news ADD COLUMN IF NOT EXISTS impact TEXT;
-
 -- Change notification for the /ws push channel (routes/ws.py).
 --
 -- In the database rather than the application because the writes come from
@@ -217,6 +212,32 @@ BEGIN
     RETURN NULL;
 END;
 $fn$ LANGUAGE plpgsql;
+"""
+
+# There is no migration framework here, and adding one for a single-user local
+# tool would be more machinery than the problem deserves. What the problem does
+# need is a home: `CREATE TABLE IF NOT EXISTS` leaves an existing table alone,
+# so a column added to _SCHEMA never reaches a database that already has the
+# table — the app then runs on the old shape while the tests, which build from
+# scratch, pass happily.
+#
+# So: every column added after a table first shipped gets a line here as well.
+# `ADD COLUMN IF NOT EXISTS` is idempotent, runs under the same advisory lock,
+# and costs a catalogue lookup per start.
+#
+# ponytail: append-only, and never reorder — this is a migration list wearing a
+# smaller hat. Reach for a real framework the day one of these needs a data
+# backfill rather than a default.
+_ALTERS = """
+ALTER TABLE news   ADD COLUMN IF NOT EXISTS impact TEXT;
+
+-- Yahoo returns the full bar in the same payload as the close; storing only
+-- `close` meant no candlesticks and, worse, no volume — which is the number
+-- that says whether a headline actually mattered.
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS open   DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS high   DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS low    DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS volume BIGINT;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for
@@ -246,5 +267,6 @@ def create_tables() -> None:
     with get_connection() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
         conn.execute(_SCHEMA)
+        conn.execute(_ALTERS)
         conn.execute(_INDEXES)
         conn.execute(_TRIGGERS)

@@ -6,22 +6,66 @@ Two kinds of row share the table, distinguished by `interval`:
 
 Daily bars give the 1-month chart; snapshots give intraday shape for the last
 day or two without paying for a real intraday feed.
+
+A row carries `open`, `high`, `low` and `volume` alongside `close`, all
+nullable. Only the sources that return real bars fill them — a snapshot is one
+number and leaves them NULL, which is honest, where a zero would render as a
+trade that never happened.
 """
 from __future__ import annotations
 
 from .connection import executemany, get_connection, one, rows
 
 
-def upsert_points(short_name: str, points: list[tuple[str, float]], interval: str = "1d") -> int:
-    """points = [(iso_ts, close)]. Re-running a backfill is a no-op."""
+def upsert_points(short_name: str, points, interval: str = "1d") -> int:
+    """Store bars. Re-running a backfill is a no-op.
+
+    Takes either shape:
+
+        [("2026-08-19T00:00:00Z", 338.19)]                  close only
+        [{"ts": ..., "close": ..., "open": ..., "high": ...,
+          "low": ..., "volume": ...}]                       a full bar
+
+    The tuple form exists because most callers genuinely have nothing but a
+    close — an hourly snapshot is one number — and making them all build a
+    dict to say so would be noise. Sources that return real bars (Yahoo's
+    chart, Stooq) pass dicts.
+
+    A missing OHLC field is stored NULL rather than defaulted: zero would
+    render as a real trade at zero.
+    """
     if not points:
         return 0
+
+    rows_ = []
+    for point in points:
+        if isinstance(point, dict):
+            bar = point
+        else:
+            ts, close = point
+            bar = {"ts": ts, "close": close}
+        if bar.get("close") is None:
+            continue
+        rows_.append((
+            short_name, bar["ts"], bar["close"], interval,
+            bar.get("open"), bar.get("high"), bar.get("low"), bar.get("volume"),
+        ))
+
+    if not rows_:
+        return 0
     with get_connection() as conn:
+        # COALESCE on update so a later close-only write (a snapshot landing on
+        # the same slot as a bar) cannot blank an OHLC we already have.
         return executemany(conn, """
-            INSERT INTO prices (short_name, ts, close, interval)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT(short_name, ts, interval) DO UPDATE SET close = excluded.close
-        """, [(short_name, ts, close, interval) for ts, close in points if close is not None])
+            INSERT INTO prices (short_name, ts, close, interval, open, high, low, volume)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(short_name, ts, interval) DO UPDATE SET
+                close  = excluded.close,
+                open   = COALESCE(excluded.open,   prices.open),
+                high   = COALESCE(excluded.high,   prices.high),
+                low    = COALESCE(excluded.low,    prices.low),
+                volume = COALESCE(excluded.volume, prices.volume)
+        """, rows_)
 
 
 def get_history(short_name: str, since: str, interval: str | None = None) -> list[dict]:
@@ -31,7 +75,8 @@ def get_history(short_name: str, since: str, interval: str | None = None) -> lis
         params.append(interval)
     with get_connection() as conn:
         return rows(conn.execute(
-            f"SELECT ts, close, interval FROM prices WHERE {' AND '.join(where)} ORDER BY ts ASC",
+            f"SELECT ts, close, interval, open, high, low, volume FROM prices "
+            f"WHERE {' AND '.join(where)} ORDER BY ts ASC",
             params,
         ))
 

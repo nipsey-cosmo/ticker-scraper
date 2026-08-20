@@ -11,9 +11,17 @@ import pytest
 from services import prices, yahoo
 
 
-def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None):
+def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None,
+                  **bars):
+    """`bars` takes open/high/low/volume series.
+
+    Omitting them is the common case and is itself worth exercising: Yahoo
+    sends `close` alone often enough that the parser must not assume the other
+    four series are present.
+    """
     closes = closes if closes is not None else [330.0, 336.91, 340.08, 338.19]
     stamps = stamps if stamps is not None else [1785072600, 1785159000, 1785245400, 1785331800]
+    quote = {"close": closes, **{k: v for k, v in bars.items() if v is not None}}
     return {
         "chart": {
             "result": [{
@@ -24,7 +32,7 @@ def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, st
                     "chartPreviousClose": 320.0,
                 },
                 "timestamp": stamps,
-                "indicators": {"quote": [{"close": closes}]},
+                "indicators": {"quote": [quote]},
             }],
             "error": None,
         }
@@ -76,7 +84,7 @@ class TestParseChart:
         assert parsed["currency"] == "GBP"
         assert parsed["price"] == pytest.approx(33.235)
         assert parsed["previous_close"] == pytest.approx(32.345)
-        assert parsed["points"][-1][1] == pytest.approx(33.235)
+        assert parsed["points"][-1]["close"] == pytest.approx(33.235)
         # Percentage change must be unaffected by the unit conversion.
         assert parsed["change_percent"] == pytest.approx(2.752, abs=1e-2)
 
@@ -84,11 +92,60 @@ class TestParseChart:
         parsed = yahoo.parse_chart(
             chart_payload(closes=[330.0, None, 340.08, None], stamps=[1, 2, 3, 4])
         )
-        assert [p[1] for p in parsed["points"]] == [330.0, 340.08]
+        assert [p["close"] for p in parsed["points"]] == [330.0, 340.08]
 
     def test_timestamps_become_canonical_iso(self):
         parsed = yahoo.parse_chart(chart_payload())
-        assert parsed["points"][-1][0] == "2026-07-29T13:30:00Z"
+        assert parsed["points"][-1]["ts"] == "2026-07-29T13:30:00Z"
+
+    def test_full_bars_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 338.19], stamps=[1, 2],
+            open=[328.0, 331.0], high=[335.0, 341.0], low=[327.0, 330.5],
+            volume=[41_000_000, 52_500_000],
+        ))
+        assert parsed["points"][-1] == {
+            "ts": "1970-01-01T00:00:02Z", "close": 338.19,
+            "open": 331.0, "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }
+
+    def test_pence_divides_the_prices_and_never_the_volume(self):
+        """Volume is a share count. Scaling it would report a hundredth of the
+        real turnover on every LSE line."""
+        parsed = yahoo.parse_chart(chart_payload(
+            currency="GBp", price=3323.5, previous=3234.5,
+            closes=[3323.5], stamps=[1],
+            open=[3300.0], high=[3350.0], low=[3290.0], volume=[8_000_000],
+        ))
+        bar = parsed["points"][0]
+        assert (bar["open"], bar["high"], bar["low"]) == (33.0, 33.5, 32.9)
+        assert bar["volume"] == 8_000_000
+
+    def test_a_close_only_payload_leaves_the_rest_none(self):
+        """Yahoo often sends `close` alone; the other series must not be
+        assumed present."""
+        bar = yahoo.parse_chart(chart_payload(closes=[330.0], stamps=[1]))["points"][0]
+        assert bar["close"] == 330.0
+        assert (bar["open"], bar["high"], bar["low"], bar["volume"]) == (None,) * 4
+
+    def test_a_hole_in_one_series_does_not_cost_the_bar(self):
+        """A null high is a hole, not a holiday — the close still stands, and
+        the gap is stored NULL rather than defaulted to a trade at zero."""
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 338.19], stamps=[1, 2],
+            open=[328.0, 331.0], high=[335.0, None], volume=[41_000_000, None],
+        ))
+        assert len(parsed["points"]) == 2
+        assert parsed["points"][-1]["high"] is None
+        assert parsed["points"][-1]["volume"] is None
+        assert parsed["points"][-1]["open"] == 331.0
+
+    def test_a_short_series_does_not_raise(self):
+        """The series are not guaranteed to be the same length as `close`."""
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 336.91, 338.19], stamps=[1, 2, 3], volume=[41_000_000],
+        ))
+        assert [p["volume"] for p in parsed["points"]] == [41_000_000, None, None]
 
     def test_previous_close_falls_back_to_the_prior_bar(self):
         payload = chart_payload()
@@ -238,10 +295,14 @@ class TestStoring:
         import db
         prices._store("AAPL", {
             "price": 338.19, "change": -1.89, "change_percent": -0.556, "currency": "USD",
-            "points": [("2026-07-29T13:30:00Z", 338.19), ("2026-07-28T13:30:00Z", 340.08)],
+            "points": [
+                {"ts": "2026-07-29T13:30:00Z", "close": 338.19, "volume": 52_500_000},
+                {"ts": "2026-07-28T13:30:00Z", "close": 340.08, "volume": 41_000_000},
+            ],
         })
         bars = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
         assert [b["ts"] for b in bars] == ["2026-07-28T00:00:00Z", "2026-07-29T00:00:00Z"]
+        assert [b["volume"] for b in bars] == [41_000_000, 52_500_000]
 
     def test_quote_is_written_to_the_stock_row(self, stocked_db):
         import db
