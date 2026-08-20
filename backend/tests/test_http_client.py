@@ -8,7 +8,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from services.http_client import Scraper, _host_of, _retry_after
+from services.http_client import _DEFAULT_RATE, Scraper, _host_of, _retry_after
 
 
 class FakeClock:
@@ -121,6 +121,126 @@ class TestCache:
         scraper.get("https://example.com/a", cache=False)
         scraper.get("https://example.com/a", cache=False)
         assert len(calls) == 2
+
+
+class TestConditionalGet:
+    """A stale entry keeps its validator, so an unchanged feed costs a 304."""
+
+    @staticmethod
+    def _versioned(seen: list, *, etag="\"v1\"", modified=None):
+        """200 with a validator first, then 304 for anyone who presents it."""
+
+        def handler(request):
+            seen.append(request.headers)
+            if (etag and request.headers.get("if-none-match") == etag) or (
+                modified and request.headers.get("if-modified-since") == modified
+            ):
+                return httpx.Response(304)
+            headers = {}
+            if etag:
+                headers["ETag"] = etag
+            if modified:
+                headers["Last-Modified"] = modified
+            return httpx.Response(200, text="feed body", headers=headers)
+
+        return handler
+
+    def test_stale_entry_revalidates_and_returns_the_held_body(self):
+        seen = []
+        clock = FakeClock()
+        scraper = make_scraper(self._versioned(seen), clock=clock, cache_ttl=60.0)
+
+        first = scraper.get("https://example.com/feed")
+        clock.now += 61                       # body stale, validator is not
+        second = scraper.get("https://example.com/feed")
+
+        assert len(seen) == 2                 # it really did go back out
+        assert seen[1].get("if-none-match") == "\"v1\""
+        assert second.text == first.text == "feed body"
+        assert second.from_cache and second.ok
+
+    def test_last_modified_is_sent_when_there_is_no_etag(self):
+        seen = []
+        stamp = "Wed, 19 Aug 2026 10:00:00 GMT"
+        clock = FakeClock()
+        scraper = make_scraper(
+            self._versioned(seen, etag=None, modified=stamp), clock=clock, cache_ttl=60.0
+        )
+
+        scraper.get("https://example.com/feed")
+        clock.now += 61
+        result = scraper.get("https://example.com/feed")
+
+        assert seen[1].get("if-modified-since") == stamp
+        assert result.text == "feed body"
+
+    def test_304_never_overwrites_the_held_body(self):
+        """The one way this could corrupt rather than merely miss."""
+        clock = FakeClock()
+        scraper = make_scraper(self._versioned([]), clock=clock, cache_ttl=60.0)
+
+        scraper.get("https://example.com/feed")
+        for _ in range(3):                    # three unchanged polls in a row
+            clock.now += 61
+            assert scraper.get("https://example.com/feed").text == "feed body"
+
+    def test_304_makes_the_entry_fresh_again(self):
+        seen = []
+        clock = FakeClock()
+        scraper = make_scraper(self._versioned(seen), clock=clock, cache_ttl=60.0)
+
+        scraper.get("https://example.com/feed")
+        clock.now += 61
+        scraper.get("https://example.com/feed")     # 304, freshness pushed out
+        scraper.get("https://example.com/feed")     # inside the new window
+
+        assert len(seen) == 2                       # the third never left
+
+    def test_a_changed_feed_still_returns_the_new_body(self):
+        bodies = iter(["old", "new"])
+
+        def handler(request):
+            return httpx.Response(200, text=next(bodies), headers={"ETag": "\"v1\""})
+
+        clock = FakeClock()
+        scraper = make_scraper(handler, clock=clock, cache_ttl=60.0)
+
+        assert scraper.get("https://example.com/feed").text == "old"
+        clock.now += 61
+        assert scraper.get("https://example.com/feed").text == "new"
+
+    def test_first_request_carries_no_validators(self):
+        seen = []
+        scraper = make_scraper(self._versioned(seen), cache_ttl=60.0)
+        scraper.get("https://example.com/feed")
+        assert "if-none-match" not in seen[0]
+
+    def test_cache_bypass_sends_no_validators(self):
+        seen = []
+        clock = FakeClock()
+        scraper = make_scraper(self._versioned(seen), clock=clock, cache_ttl=60.0)
+
+        scraper.get("https://example.com/feed")
+        clock.now += 61
+        scraper.get("https://example.com/feed", cache=False)
+
+        assert "if-none-match" not in seen[1]
+
+    def test_304_is_a_clean_answer_not_a_failure(self):
+        """It must not look like an error to the breaker, nor stall the rate."""
+        clock = FakeClock()
+        scraper = make_scraper(self._versioned([]), clock=clock, cache_ttl=60.0)
+
+        scraper.get("https://example.com/feed")
+        for _ in range(9):
+            clock.now += 61
+            scraper.get("https://example.com/feed")
+
+        host = next(s for s in scraper.stats() if s["host"] == "example.com")
+        assert host["failures"] == 0 and host["throttled"] == 0
+        assert not host["circuit_open"]
+        # Nine clean 304s past _PROBE_AFTER: they count as headroom evidence.
+        assert host["rate_per_sec"] > _DEFAULT_RATE[0]
 
 
 class TestAdaptiveRate:

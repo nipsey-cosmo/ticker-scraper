@@ -38,7 +38,14 @@ modes. Two of these five just stop discarding data already in hand.
 
 ### 1.1 — A1 · Conditional GET
 
-- [ ] `feat: send conditional GET so an unchanged feed costs a 304`
+- [x] `feat: send conditional GET so an unchanged feed costs a 304`
+
+**Done.** One dict, not two: the entry is `(fresh_until, Fetched)` and is kept
+past `fresh_until` rather than deleted, so the body goes stale while its
+validator does not. That satisfies "validators outlive `cache_ttl`" with one
+lookup method instead of two parallel stores — and it means a 304 always has a
+body to hand back, which two stores would not have guaranteed. Cap raised
+512 → 1024 because entries now live longer.
 
 **Files** `backend/services/http_client.py`, `backend/tests/test_http_client.py`
 
