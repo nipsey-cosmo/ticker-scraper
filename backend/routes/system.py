@@ -1,7 +1,9 @@
 """Health and manual refresh.
 
 /health reports per-host scraper stats, which is the fastest way to see whether
-a source is being throttled or has had its circuit opened.
+a source is being throttled or has had its circuit opened, and per-source
+yields, which is the only way to see a source that is answering 200 and
+returning nothing.
 """
 from __future__ import annotations
 
@@ -71,6 +73,10 @@ def health():
         "ai_summaries": _ai_state(),
         "impact_grading": "enabled" if events.enabled() else "disabled",
         "scrapers": scraper.stats(),
+        # What each source actually returned, which the per-host counters
+        # above cannot show: a scraper whose selector has gone stale answers
+        # 200 every time and contributes nothing.
+        "sources": db.sources.yields(days=7),
     }
 
 

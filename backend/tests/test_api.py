@@ -26,6 +26,54 @@ class TestHealth:
         assert client.get("/openapi.json").status_code == 200
 
 
+class TestSourceYield:
+    """A source answering 200 with nothing is indistinguishable from a quiet
+    news day unless somebody counts what came back."""
+
+    def test_a_source_that_ran_and_found_nothing_is_stalled(self, client):
+        import db
+        db.sources.record({"BING_NEWS": 0, "GOOGLE_NEWS": 12})
+
+        by_source = {s["source_type"]: s for s in client.get("/health").json()["sources"]}
+        assert by_source["BING_NEWS"]["stalled"] is True
+        assert by_source["GOOGLE_NEWS"]["stalled"] is False
+
+    def test_a_source_skipped_by_design_is_not_stalled(self, client):
+        """Three of seven sources are US-only and one is opt-in. Without this
+        every London listing would report four dead scrapers."""
+        import db
+        db.sources.record({"GOOGLE_NEWS": 3}, skipped={"FINVIZ", "SEC_EDGAR"})
+
+        by_source = {s["source_type"]: s for s in client.get("/health").json()["sources"]}
+        assert by_source["FINVIZ"]["stalled"] is False
+        assert by_source["FINVIZ"]["skips"] == 1
+        assert by_source["FINVIZ"]["fetches"] == 0
+
+    def test_counts_accumulate_across_stocks(self, temp_db):
+        import db
+        db.sources.record({"FINVIZ": 4})
+        db.sources.record({"FINVIZ": 6})
+
+        finviz = next(s for s in db.sources.yields() if s["source_type"] == "FINVIZ")
+        assert finviz["articles"] == 10 and finviz["fetches"] == 2
+
+    def test_one_good_fetch_clears_a_stall_over_the_window(self, temp_db):
+        """Stalled is about the window, not the last attempt — a source that
+        found nothing for this one stock is not broken."""
+        import db
+        db.sources.record({"NASDAQ": 0})
+        db.sources.record({"NASDAQ": 0})
+        db.sources.record({"NASDAQ": 5})
+
+        nasdaq = next(s for s in db.sources.yields() if s["source_type"] == "NASDAQ")
+        assert nasdaq["stalled"] is False and nasdaq["fetches"] == 3
+
+    def test_recording_nothing_is_harmless(self, temp_db):
+        import db
+        db.sources.record({}, skipped=set())
+        assert db.sources.yields() == []
+
+
 class TestNoAuth:
     def test_no_auth_routes_remain(self, client):
         paths = client.get("/openapi.json").json()["paths"]

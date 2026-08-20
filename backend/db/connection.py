@@ -211,6 +211,25 @@ CREATE TABLE IF NOT EXISTS events (
     tokens_total     INTEGER NOT NULL DEFAULT 0
 );
 
+-- How much each news source actually returned, per day.
+--
+-- In the database rather than a process counter because the refreshes run in
+-- the scheduler process and /health is served by the API: an in-memory tally
+-- would be written by one and read by the other, which is to say never read.
+--
+-- `skips` is what stops the alerting crying wolf. Three of the seven sources
+-- are US-only and one is off unless a contact address is configured, so a
+-- source can legitimately return nothing all day without being broken. A
+-- source that *ran* and returned nothing is the one worth looking at.
+CREATE TABLE IF NOT EXISTS source_yield (
+    source_type TEXT NOT NULL,
+    date        TEXT NOT NULL,              -- YYYY-MM-DD UTC
+    articles    INTEGER NOT NULL DEFAULT 0,
+    fetches     INTEGER NOT NULL DEFAULT 0, -- times it actually went out
+    skips       INTEGER NOT NULL DEFAULT 0, -- times it was skipped by design
+    PRIMARY KEY (source_type, date)
+);
+
 -- Runtime feature flags set from the UI (db/flags.py). Deliberately not in
 -- the notify trigger list below: a flag change is answered to the client that
 -- made it, and pushing it would make every other tab re-fetch the whole feed

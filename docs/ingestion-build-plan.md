@@ -184,7 +184,18 @@ quote source returned none.
 
 ### 1.5 — E1 · Per-source yield metrics
 
-- [ ] `feat: report articles per source so a dead feed stops looking like quiet news`
+- [x] `feat: report articles per source so a dead feed stops looking like quiet news`
+
+**Done.** Counts live in a `source_yield` table, not process memory, because
+the refreshes run in the **scheduler** process and `/health` is served by the
+**API** — an in-memory tally would be written by one and read by the other.
+`stalled` is computed over the 7-day window rather than the last attempt, so a
+source finding nothing for one quiet stock is not an alarm.
+
+The skip accounting matters more than expected: EDGAR declines itself inside
+`fetch()` when no contact address is set, which reads externally as "answered
+with nothing" — the exact signature of a dead scraper. `collect` now checks
+`sec_enabled()` before queuing it and records the skip explicitly.
 
 **Files** `backend/services/news/__init__.py`, `backend/routes/system.py`,
 `backend/tests/test_api.py`
