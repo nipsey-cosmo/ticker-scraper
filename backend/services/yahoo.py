@@ -149,6 +149,8 @@ def parse_chart(data: dict) -> dict | None:
         round((change / previous) * 100, 3) if previous and change is not None else None
     )
 
+    dividends, splits = _corporate_actions(node, divisor)
+
     return {
         "symbol": meta.get("symbol"),
         "exchange": meta.get("exchangeName"),
@@ -160,7 +162,50 @@ def parse_chart(data: dict) -> dict | None:
         "change": change,
         "change_percent": change_percent,
         "points": points,
+        "dividends": dividends,
+        "splits": splits,
     }
+
+
+def _corporate_actions(node: dict, divisor: float) -> tuple[list[dict], list[dict]]:
+    """The `events` block the chart call has always asked for and never read.
+
+    Yahoo keys both maps by epoch second, so the payload is
+    `{"dividends": {"1785072600": {"amount": .., "date": ..}}, "splits": {...}}`.
+    """
+    events = node.get("events")
+    if not isinstance(events, dict):
+        return [], []
+
+    dividends = []
+    for entry in (events.get("dividends") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        amount, stamp = entry.get("amount"), entry.get("date")
+        if amount is None or stamp is None:
+            continue
+        # A dividend is money, quoted in the same minor unit as the price, so
+        # an LSE payout arrives in pence and has to come down with everything
+        # else. Volume is the only field here that must *not* be scaled.
+        dividends.append({"ex_date": _iso_from_epoch(stamp)[:10],
+                          "amount": round(amount / divisor, 6)})
+
+    splits = []
+    for entry in (events.get("splits") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        numerator = entry.get("numerator")
+        denominator = entry.get("denominator")
+        stamp = entry.get("date")
+        if not numerator or not denominator or stamp is None:
+            continue
+        splits.append({"ex_date": _iso_from_epoch(stamp)[:10],
+                       "numerator": float(numerator),
+                       "denominator": float(denominator)})
+
+    dividends.sort(key=lambda d: d["ex_date"])
+    splits.sort(key=lambda s: s["ex_date"])
+    return dividends, splits
 
 
 def _at(series, index):

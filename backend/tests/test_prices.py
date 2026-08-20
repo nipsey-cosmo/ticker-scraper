@@ -12,7 +12,7 @@ from services import prices, yahoo
 
 
 def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None,
-                  **bars):
+                  events=None, **bars):
     """`bars` takes open/high/low/volume series.
 
     Omitting them is the common case and is itself worth exercising: Yahoo
@@ -22,9 +22,11 @@ def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, st
     closes = closes if closes is not None else [330.0, 336.91, 340.08, 338.19]
     stamps = stamps if stamps is not None else [1785072600, 1785159000, 1785245400, 1785331800]
     quote = {"close": closes, **{k: v for k, v in bars.items() if v is not None}}
+    node_extra = {"events": events} if events else {}
     return {
         "chart": {
             "result": [{
+                **node_extra,
                 "meta": {
                     "symbol": "TEST", "exchangeName": "NMS", "fullExchangeName": "NasdaqGS",
                     "instrumentType": "EQUITY", "currency": currency,
@@ -165,6 +167,122 @@ class TestParseChart:
         payload["chart"]["result"][0]["timestamp"] = []
         payload["chart"]["result"][0]["indicators"] = {"quote": [{"close": []}]}
         assert yahoo.parse_chart(payload) is None
+
+
+SPLIT_4_FOR_1 = {"splits": {"1785072600": {
+    "date": 1785072600, "numerator": 4, "denominator": 1, "splitRatio": "4:1",
+}}}
+
+DIVIDEND = {"dividends": {"1785072600": {"amount": 0.24, "date": 1785072600}}}
+
+
+class TestCorporateActions:
+    """The `events` block the chart call has always requested and never read."""
+
+    def test_dividends_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(events=DIVIDEND))
+        assert parsed["dividends"] == [{"ex_date": "2026-07-26", "amount": 0.24}]
+
+    def test_a_dividend_is_money_so_pence_are_converted(self):
+        parsed = yahoo.parse_chart(chart_payload(currency="GBp", events=DIVIDEND))
+        assert parsed["dividends"][0]["amount"] == pytest.approx(0.0024)
+
+    def test_splits_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(events=SPLIT_4_FOR_1))
+        assert parsed["splits"] == [
+            {"ex_date": "2026-07-26", "numerator": 4.0, "denominator": 1.0}
+        ]
+
+    def test_no_events_block_is_not_an_error(self):
+        parsed = yahoo.parse_chart(chart_payload())
+        assert parsed["dividends"] == [] and parsed["splits"] == []
+
+    @pytest.mark.parametrize("events", [
+        {"splits": {"1": {"date": 1, "numerator": 0, "denominator": 1}}},
+        {"splits": {"1": {"date": 1, "numerator": 4}}},
+        {"splits": {"1": "not a dict"}},
+        {"dividends": {"1": {"date": 1}}},
+    ])
+    def test_malformed_events_are_skipped_not_raised(self, events):
+        parsed = yahoo.parse_chart(chart_payload(events=events))
+        assert parsed["dividends"] == [] and parsed["splits"] == []
+
+
+class TestSplitAdjustment:
+    """A split makes every price before it incomparable with every price after.
+    Adjusting once is correct; adjusting twice is a 16x error on a 4:1."""
+
+    @staticmethod
+    def _seed(short_name="AAPL"):
+        import db
+        db.prices.upsert_points(short_name, [
+            {"ts": "2026-07-24T00:00:00Z", "close": 400.0, "open": 396.0,
+             "high": 404.0, "low": 395.0, "volume": 10_000_000},
+            {"ts": "2026-07-25T00:00:00Z", "close": 440.0, "open": 430.0,
+             "high": 444.0, "low": 428.0, "volume": 12_000_000},
+        ])
+
+    def _quote(self):
+        return {"price": 110.0, "change": 0.0, "change_percent": 0.0,
+                "currency": "USD", "points": [], "dividends": [],
+                "splits": [{"ex_date": "2026-07-26", "numerator": 4.0,
+                            "denominator": 1.0}]}
+
+    def test_history_before_the_ex_date_is_brought_onto_the_new_scale(self, stocked_db):
+        import db
+        self._seed()
+        prices._store("AAPL", self._quote())
+
+        bars = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+        assert [b["close"] for b in bars] == [100.0, 110.0]
+        assert [b["high"] for b in bars] == [101.0, 111.0]
+        # Four times the shares at a quarter of the price.
+        assert [b["volume"] for b in bars] == [40_000_000, 48_000_000]
+
+    def test_applying_the_same_split_twice_changes_nothing(self, stocked_db):
+        """The one way this could corrupt the series rather than merely miss."""
+        import db
+        self._seed()
+        prices._store("AAPL", self._quote())
+        after_once = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+
+        for _ in range(3):                       # three more refreshes carry it
+            prices._store("AAPL", self._quote())
+
+        assert db.prices.get_history("AAPL", "2026-07-01", interval="1d") == after_once
+
+    def test_bars_on_or_after_the_ex_date_are_left_alone(self, stocked_db):
+        """They already arrived on the post-split scale."""
+        import db
+        db.prices.upsert_points("AAPL", [
+            {"ts": "2026-07-25T00:00:00Z", "close": 440.0},
+            {"ts": "2026-07-26T00:00:00Z", "close": 110.0},
+            {"ts": "2026-07-27T00:00:00Z", "close": 112.0},
+        ])
+        prices._store("AAPL", self._quote())
+
+        assert [b["close"] for b in db.prices.get_history("AAPL", "2026-07-01",
+                                                          interval="1d")] == \
+            [110.0, 110.0, 112.0]
+
+    def test_a_one_for_one_split_is_ignored(self, stocked_db):
+        import db
+        self._seed()
+        quote = {**self._quote(), "splits": [
+            {"ex_date": "2026-07-26", "numerator": 1.0, "denominator": 1.0}]}
+        prices._store("AAPL", quote)
+        assert db.prices.get_splits("AAPL") == []
+
+    def test_dividends_are_stored_and_re_run_cleanly(self, stocked_db):
+        import db
+        quote = {**self._quote(), "splits": [],
+                 "dividends": [{"ex_date": "2026-07-26", "amount": 0.24}]}
+        prices._store("AAPL", quote)
+        prices._store("AAPL", quote)
+
+        stored = db.prices.get_dividends("AAPL")
+        assert len(stored) == 1
+        assert stored[0]["amount"] == 0.24 and stored[0]["currency"] == "USD"
 
 
 class TestCnbcNumbers:

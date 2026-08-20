@@ -143,6 +143,31 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (short_name, ts, interval)
 );
 
+-- Corporate actions, from the `events` block of Yahoo's chart response.
+--
+-- `splits` is not just a display table: it is the idempotency record for the
+-- back-adjustment. A split makes every price before it incomparable with
+-- every price after it, so stored history has to be divided through when one
+-- lands — and doing that twice would halve the series again. The primary key
+-- is what makes "have we already applied this one?" a question the database
+-- answers rather than the application guessing.
+CREATE TABLE IF NOT EXISTS splits (
+    short_name  TEXT NOT NULL,
+    ex_date     TEXT NOT NULL,              -- YYYY-MM-DD UTC
+    numerator   DOUBLE PRECISION NOT NULL,  -- 4 and 1 for a 4:1 split
+    denominator DOUBLE PRECISION NOT NULL,
+    applied_at  TEXT NOT NULL DEFAULT {_NOW},
+    PRIMARY KEY (short_name, ex_date)
+);
+
+CREATE TABLE IF NOT EXISTS dividends (
+    short_name TEXT NOT NULL,
+    ex_date    TEXT NOT NULL,               -- YYYY-MM-DD UTC
+    amount     DOUBLE PRECISION NOT NULL,   -- major units, like every price here
+    currency   TEXT,
+    PRIMARY KEY (short_name, ex_date)
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     short_name    TEXT PRIMARY KEY,
     created_at    TEXT NOT NULL DEFAULT {_NOW},

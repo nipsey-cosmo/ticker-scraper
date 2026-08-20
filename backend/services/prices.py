@@ -17,6 +17,11 @@ broken.
 Everything is stored in *major* currency units: LSE quotes arrive in pence and
 Tel Aviv in agorot, and a chart that silently mixes 3323.5 with 33.235 is worse
 than no chart.
+
+Corporate actions ride along on the same Yahoo response. Dividends are stored;
+splits additionally rescale the history already on disk, because a refresh only
+re-fetches a few days and every older row would otherwise stay on the pre-split
+scale — a cliff in the chart that no source agrees with.
 """
 from __future__ import annotations
 
@@ -272,6 +277,14 @@ def refresh_stock(short_name: str, range_: str = "5d") -> dict | None:
 
 
 def _store(short_name: str, quote: dict) -> None:
+    # Before the points, and that ordering is the whole trick. Yahoo returns
+    # the requested window *already* split-adjusted, so incoming bars are on
+    # the new scale while rows stored before the split are still on the old
+    # one. Adjusting first moves only the stale rows; the fresh ones then land
+    # on top at the scale they arrived in. Insert first and the adjustment
+    # would divide the new bars through a second time.
+    _store_corporate_actions(short_name, quote)
+
     if quote.get("points"):
         # Daily bars are stamped at midnight UTC so one trading day is one row
         # regardless of which session time the exchange reports.
@@ -290,6 +303,30 @@ def _store(short_name: str, quote: dict) -> None:
         "change_percent": quote.get("change_percent"),
         "currency": quote.get("currency"),
     }])
+
+
+def _store_corporate_actions(short_name: str, quote: dict) -> None:
+    """Record dividends, and bring history onto the scale of any new split.
+
+    `record_split` is the guard: it returns True only for a split we have not
+    seen, so the adjustment below runs exactly once per event no matter how
+    many refreshes carry it. Without that, every hourly refresh for the next
+    month would halve the same history again.
+    """
+    if dividends := quote.get("dividends"):
+        db.prices.upsert_dividends(short_name, dividends, quote.get("currency"))
+
+    for split in quote.get("splits") or []:
+        ratio = split["numerator"] / split["denominator"]
+        if ratio == 1:
+            continue
+        if not db.prices.record_split(short_name, split["ex_date"],
+                                      split["numerator"], split["denominator"]):
+            continue                                   # already applied
+        moved = db.prices.adjust_for_split(short_name, split["ex_date"], ratio)
+        print(f"[prices] {short_name}: {split['numerator']:g}:"
+              f"{split['denominator']:g} split on {split['ex_date']}, "
+              f"adjusted {moved} stored bars")
 
 
 def _store_snapshot(short_name: str, price: float) -> None:

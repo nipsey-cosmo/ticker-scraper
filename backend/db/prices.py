@@ -114,6 +114,83 @@ def close_on_or_before(short_name: str, ts: str) -> dict | None:
         """, (short_name, ts)))
 
 
+# ── Corporate actions ────────────────────────────────────────────────────
+
+def record_split(short_name: str, ex_date: str, numerator: float,
+                 denominator: float) -> bool:
+    """Remember a split. True only the first time it is seen.
+
+    That return value is the whole idempotency story for `adjust_for_split`:
+    the unique key decides whether this split has already been applied, so a
+    second refresh that sees the same event does nothing rather than halving
+    the history again.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            INSERT INTO splits (short_name, ex_date, numerator, denominator)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (short_name, ex_date) DO NOTHING
+        """, (short_name, ex_date, numerator, denominator)).rowcount > 0
+
+
+def adjust_for_split(short_name: str, ex_date: str, ratio: float) -> int:
+    """Bring stored history onto the post-split scale.
+
+    A 4-for-1 split quadruples the share count and quarters the price, so
+    every bar *before* the ex-date was quoted on a scale four times too high.
+    Prices divide by the ratio and volume multiplies by it.
+
+    Only rows strictly before the ex-date move: the ex-date bar itself already
+    arrived on the new scale.
+
+    Callers must gate this on `record_split` returning True. Running it twice
+    would adjust an already-adjusted series.
+    """
+    if ratio <= 0:
+        return 0
+    with get_connection() as conn:
+        return conn.execute("""
+            UPDATE prices SET
+                close  = close / %s,
+                open   = open  / %s,
+                high   = high  / %s,
+                low    = low   / %s,
+                volume = (volume * %s)::BIGINT
+            WHERE short_name = %s AND ts < %s
+        """, (ratio, ratio, ratio, ratio, ratio, short_name, ex_date)).rowcount
+
+
+def upsert_dividends(short_name: str, dividends: list[dict],
+                     currency: str | None = None) -> int:
+    """dividends = [{"ex_date", "amount"}], amounts already in major units."""
+    if not dividends:
+        return 0
+    with get_connection() as conn:
+        return executemany(conn, """
+            INSERT INTO dividends (short_name, ex_date, amount, currency)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (short_name, ex_date) DO UPDATE SET
+                amount = excluded.amount, currency = excluded.currency
+        """, [(short_name, d["ex_date"], d["amount"], currency) for d in dividends])
+
+
+def get_dividends(short_name: str, since: str = "") -> list[dict]:
+    with get_connection() as conn:
+        return rows(conn.execute("""
+            SELECT ex_date, amount, currency FROM dividends
+            WHERE short_name = %s AND ex_date >= %s
+            ORDER BY ex_date DESC
+        """, (short_name, since)))
+
+
+def get_splits(short_name: str) -> list[dict]:
+    with get_connection() as conn:
+        return rows(conn.execute("""
+            SELECT ex_date, numerator, denominator FROM splits
+            WHERE short_name = %s ORDER BY ex_date DESC
+        """, (short_name,)))
+
+
 def delete_older_than(cutoff_iso: str) -> int:
     with get_connection() as conn:
         return conn.execute("DELETE FROM prices WHERE ts < %s", (cutoff_iso,)).rowcount

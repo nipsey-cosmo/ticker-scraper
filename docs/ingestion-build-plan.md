@@ -104,7 +104,20 @@ skipped rather than stored as zero.
 
 ### 1.3 — C2 · Splits and dividends
 
-- [ ] `feat: read the splits and dividends the chart call already asks for`
+- [x] `feat: read the splits and dividends the chart call already asks for`
+
+**Done.** Idempotency is the `splits` table's primary key, not application
+logic: `record_split` returns True only on first sight and the adjustment is
+gated on it, so the database answers "have we applied this?" rather than the
+code guessing.
+
+The subtle part turned out to be **ordering**, not the arithmetic. Yahoo
+returns the requested window already split-adjusted, so incoming bars are on
+the new scale while stored ones are not. `_store` therefore adjusts *before*
+inserting: adjust-then-insert moves only the stale rows, insert-then-adjust
+would divide the fresh bars a second time. `adjust_for_split` uses `ts <
+ex_date` so the ex-date bar itself, which already arrived rescaled, is left
+alone.
 
 **Files** `backend/services/yahoo.py`, `backend/db/connection.py`,
 `backend/db/prices.py`, `backend/tests/test_prices.py`
