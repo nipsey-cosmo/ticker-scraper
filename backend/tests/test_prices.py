@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from services import prices, yahoo
+from services import prices, stooq, yahoo
 
 
 def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None,
@@ -283,6 +283,157 @@ class TestSplitAdjustment:
         stored = db.prices.get_dividends("AAPL")
         assert len(stored) == 1
         assert stored[0]["amount"] == 0.24 and stored[0]["currency"] == "USD"
+
+
+STOOQ_CSV = """Date,Open,High,Low,Close,Volume
+2026-08-17,328.00,335.00,327.00,330.00,41000000
+2026-08-18,331.00,341.00,330.50,338.19,52500000
+"""
+
+
+class TestStooqSymbols:
+    """Mapping is the whole job. A wrong symbol does not fail — it silently
+    backfills the chart with another venue's prices."""
+
+    @pytest.mark.parametrize("yahoo_symbol,expected", [
+        ("AAPL", "aapl.us"),
+        ("SHEL.L", "shel.uk"),
+        ("SAP.DE", "sap.de"),
+        ("7203.T", "7203.jp"),
+    ])
+    def test_known_venues_map(self, yahoo_symbol, expected):
+        assert stooq.to_stooq(yahoo_symbol) == expected
+
+    @pytest.mark.parametrize("yahoo_symbol", [
+        "SHEL.MU",      # Munich — same company, different venue, different price
+        "BHP.AX",       # Sydney — Stooq does not carry it
+        "^GSPC",        # index, named differently there
+        "", "   ", ".L",
+    ])
+    def test_anything_unmapped_declines_rather_than_guesses(self, yahoo_symbol):
+        assert stooq.to_stooq(yahoo_symbol) is None
+
+
+class TestStooqParsing:
+    def test_bars_are_parsed_oldest_first(self):
+        bars = stooq.parse_csv(STOOQ_CSV)
+        assert [b["ts"] for b in bars] == \
+            ["2026-08-17T00:00:00Z", "2026-08-18T00:00:00Z"]
+        assert bars[-1] == {
+            "ts": "2026-08-18T00:00:00Z", "close": 338.19, "open": 331.0,
+            "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }
+
+    def test_the_no_data_body_is_not_a_bar(self):
+        """Stooq answers an unknown symbol with HTTP 200 and this body, so the
+        status code cannot be trusted."""
+        assert stooq.parse_csv("No data") == []
+
+    def test_a_row_with_no_close_is_skipped(self):
+        text = "Date,Open,High,Low,Close,Volume\n2026-08-18,331.00,341.00,330.50,,0\n"
+        assert stooq.parse_csv(text) == []
+
+    def test_empty_and_junk_bodies_are_safe(self):
+        assert stooq.parse_csv("") == []
+        assert stooq.parse_csv("<html>nope</html>") == []
+
+
+class TestStooqFetch:
+    @staticmethod
+    def _serving(text):
+        from services.http_client import Fetched
+        return lambda *a, **kw: Fetched(
+            url="https://stooq.com/q/d/l/", status=200, text=text,
+            content=text.encode(), headers={},
+        )
+
+    def test_history_drops_bars_older_than_the_requested_range(self, monkeypatch):
+        """Stooq hands back decades; storing all of it for a 1-month chart
+        would be a lot of rows nobody asked for."""
+        old = "Date,Open,High,Low,Close,Volume\n1999-01-04,1,1,1,1.23,100\n"
+        monkeypatch.setattr(stooq.scraper, "get", self._serving(old + STOOQ_CSV.split("\n", 1)[1]))
+        bars = stooq.history("AAPL", range_="1mo")
+        assert all(bar["ts"] > "2000" for bar in bars)
+
+    def test_an_unmapped_symbol_never_reaches_the_network(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(stooq.scraper, "get", lambda *a, **kw: called.append(1))
+        assert stooq.history("SHEL.MU") == []
+        assert not called
+
+
+class TestStooqBackfill:
+    """Runs in `refresh_stock`, not `get_quote`: deciding whether history has
+    fallen behind needs the database, and the gate is what stops a Yahoo
+    outage becoming a CSV download per stock every five minutes."""
+
+    @staticmethod
+    def _bar_less_quote(monkeypatch):
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_nasdaq", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_cnbc", lambda *a, **kw: {
+            "price": 338.19, "change": 0.0, "change_percent": 0.0,
+            "points": [], "source": "cnbc", "currency": "USD"})
+
+    def test_it_fills_history_when_the_stored_series_is_stale(self, stocked_db, monkeypatch):
+        """A CNBC quote carries no bars; without this the chart just freezes."""
+        import db
+        self._bar_less_quote(monkeypatch)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: stooq.parse_csv(STOOQ_CSV))
+
+        prices.refresh_stock("AAPL", range_="1mo")
+        stored = db.prices.get_history("AAPL", "2026-01-01", interval="1d")
+        assert [b["close"] for b in stored] == [330.0, 338.19]
+        assert [b["volume"] for b in stored] == [41_000_000, 52_500_000]
+
+    def test_a_current_series_is_not_re_downloaded(self, stocked_db, monkeypatch):
+        """The five-minute price job must not pull a daily CSV every tick."""
+        import db
+        from normalize import days_ago_iso
+        db.prices.upsert_points("AAPL", [
+            {"ts": days_ago_iso(1)[:10] + "T00:00:00Z", "close": 338.19}])
+
+        called = []
+        self._bar_less_quote(monkeypatch)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        prices.refresh_stock("AAPL", range_="5d")
+        assert not called
+
+    def test_a_source_with_its_own_bars_never_asks_stooq(self, stocked_db, monkeypatch):
+        called = []
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: {
+            "price": 338.19, "change": 0.0, "change_percent": 0.0,
+            "source": "yahoo", "currency": "USD",
+            "points": [{"ts": "2026-08-18T00:00:00Z", "close": 338.19}]})
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        prices.refresh_stock("AAPL")
+        assert not called
+
+    def test_every_source_failing_still_returns_none(self, stocked_db, monkeypatch):
+        """Stooq backfills a quote; it does not invent one."""
+        for name in ("from_yahoo", "from_nasdaq", "from_cnbc"):
+            monkeypatch.setattr(prices, name, lambda *a, **kw: None)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: stooq.parse_csv(STOOQ_CSV))
+        assert prices.refresh_stock("AAPL") is None
+
+    def test_get_quote_alone_never_touches_the_network_for_history(self, monkeypatch):
+        """It is a pure three-source chain; the DB-aware half lives elsewhere."""
+        called = []
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_nasdaq", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_cnbc", lambda *a, **kw: {
+            "price": 1.0, "points": [], "source": "cnbc"})
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        assert prices.get_quote("AAPL")["source"] == "cnbc"
+        assert not called
 
 
 class TestCnbcNumbers:

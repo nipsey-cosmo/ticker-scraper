@@ -111,6 +111,10 @@ _HOST_RATES: dict[str, tuple[float, float]] = {
     "www.nasdaq.com": (1.0, 3.0),
     "www.sec.gov": (2.0, 8.0),
     "quote.cnbc.com": (2.0, 6.0),
+    # A CSV download rather than an API, and a small operation. Kept low
+    # deliberately: it is a fallback, so it only runs when something else has
+    # already failed, and it never needs to be fast.
+    "stooq.com": (0.5, 2.0),
 }
 _DEFAULT_RATE = (1.5, 4.0)
 _MIN_RATE = 0.2

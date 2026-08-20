@@ -140,7 +140,25 @@ same payload through twice leaves the series unchanged.
 
 ### 1.4 — C3 · Stooq as history fallback
 
-- [ ] `feat: fall back to Stooq for history when Yahoo has none`
+- [x] `feat: fall back to Stooq for history when Yahoo has none`
+
+**Done, but not where the plan said.** Putting the backfill in `get_quote`
+worked and was wrong twice over: it made a pure function hit the network, and
+because the price job ticks every five minutes while a market is open, one
+Yahoo outage would have meant a full CSV download **per stock per tick** for a
+file that changes once a day. It moved to `refresh_stock`, gated on the stored
+daily series having no bar within `_HISTORY_GRACE_DAYS` (4, so Friday's close
+still counts on Monday).
+
+The full suite caught it and the isolated file did not — three older
+`TestFallbackChain` tests build quotes with no `points` key, so they silently
+started making live requests to stooq.com. Worth remembering: running only the
+file you touched can hide a change that widens what other tests reach for.
+
+Suffix map is deliberately narrow (`us`, `uk`, `de`, `jp`, `pl`, `hu`). German
+regional venues are left unmapped on purpose — `.MU` onto `.de` is the same
+company at a different venue, and a fallback that quietly swaps venues is
+worse than one that declines.
 
 **Files** `backend/services/stooq.py` (new), `backend/services/prices.py`,
 `backend/tests/test_prices.py`
