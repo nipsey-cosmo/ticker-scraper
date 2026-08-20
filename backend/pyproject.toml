@@ -58,3 +58,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    # Real requests to real sources. Skipped unless asked for by name, so
+    # the normal suite stays offline, fast and deterministic:
+    #     pytest -m live tests/test_live_sources.py
+    "live: hits the network; run with -m live",
+]

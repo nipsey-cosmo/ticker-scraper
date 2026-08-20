@@ -489,7 +489,26 @@ ignored, and the stored delta is the change and not the level.
 
 ### 2.6 — E2 · Live smoke test
 
-- [ ] `test: add an opt-in live smoke test for every source parser`
+- [x] `test: add an opt-in live smoke test for every source parser`
+
+**Done, and it immediately earned its keep.** Thirteen live tests, marked per
+class rather than module-wide so the gate's own test can sit in the same file
+and actually run. `conftest.pytest_collection_modifyitems` skips anything
+marked `live` unless `-m live` names it - not a default `-m` in the config,
+because any `-m` the caller passes would then override it.
+
+`TestTheGate` is unmarked on purpose and includes a guard that every other
+`Test*` class in the file carries the marker: a new class added without it
+would run live in the normal suite, which is the one failure mode that makes
+this whole file a liability.
+
+**Twelve of thirteen sources answer. Stooq does not.** It now serves the CSV
+endpoint a **200 carrying a JavaScript browser-check interstitial**, so 1.4's
+history fallback has been returning `[]` and reading as "no data". The
+fixture tests still pass, which is exactly the blindness this sub-point was
+positioned to catch. `stooq.history` now tells HTML from CSV and says so;
+the live test is `xfail` with the reason. **This is the evidence 3.4 asks
+for** - see the note there.
 
 **Files** `backend/tests/test_live_sources.py` (new),
 `backend/pyproject.toml`, `backend/tests/conftest.py`
@@ -601,10 +620,18 @@ anti-bot databases since 2017 — a host behind Cloudflare Bot Management blocks
 at the handshake, before a header is read. Put `curl_cffi` with
 `impersonate="chrome"` behind a flag.
 
+**Evidence gathered in Part 2 - two hosts are refusing, so build it:**
+- **stooq.com** answers its CSV endpoint with a 200 carrying a JavaScript
+  browser-check page. Found by 2.6's live suite; 1.4's history fallback is
+  dead until this lands. `services/stooq.py` already detects and logs it.
+- **accessnewswire.com** returns a flat 403 to both curl and the scraper's
+  rotated fingerprint, which is why 2.2 shipped three wires instead of four.
+  Adding it is a one-line `_FEEDS` entry once the transport can get through.
+- GlobeNewswire 403s a plain curl but *does* answer the existing scraper, so
+  header rotation is still doing real work - this replaces the transport
+  beneath it, nothing else.
+
 **Watch**
-- **Only build this if a host is actually 403-ing.** If nothing is refusing,
-  tick the box with a one-line note in this file and skip it — premature
-  insurance is just complexity. Check `/health` throttle counters first.
 - Every rate-limit, breaker and cache line stays untouched. This swaps the
   transport, nothing else.
 - It also restores real HTTP/2 without the hpack thread-safety bug that forced

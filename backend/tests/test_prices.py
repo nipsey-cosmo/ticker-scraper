@@ -314,6 +314,30 @@ class TestStooqSymbols:
         assert stooq.to_stooq(yahoo_symbol) is None
 
 
+class TestStooqBlocked:
+    """An anti-bot interstitial arrives as a 200 carrying HTML, which is not
+    the same as "no data for this symbol" even though both give no bars — one
+    of them means the fallback itself has stopped falling back."""
+
+    def test_a_browser_check_page_is_reported_not_swallowed(self, monkeypatch, capsys):
+        from types import SimpleNamespace
+        monkeypatch.setattr(stooq.scraper, "get", lambda *a, **kw: SimpleNamespace(
+            status=200, ok=True,
+            text='<!DOCTYPE html><html><head><meta charset="utf-8"></head>'
+                 "<body><noscript>This site requires JavaScript</noscript></body></html>"))
+
+        assert stooq.history("AAPL") == []
+        assert "blocked" in capsys.readouterr().out
+
+    def test_a_genuine_no_data_answer_stays_quiet(self, monkeypatch, capsys):
+        from types import SimpleNamespace
+        monkeypatch.setattr(stooq.scraper, "get",
+                            lambda *a, **kw: SimpleNamespace(status=200, ok=True,
+                                                             text="No data"))
+        assert stooq.history("AAPL") == []
+        assert "blocked" not in capsys.readouterr().out
+
+
 class TestStooqParsing:
     def test_bars_are_parsed_oldest_first(self):
         bars = stooq.parse_csv(STOOQ_CSV)

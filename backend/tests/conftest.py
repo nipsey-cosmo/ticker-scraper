@@ -24,6 +24,21 @@ import settings  # noqa: E402
 TEST_DSN = os.getenv("STOCKY_TEST_DSN") or "postgresql://postgres@localhost:5432/stocky_test"
 
 
+def pytest_collection_modifyitems(config, items):
+    """Live source tests are opt-in: `pytest -m live`.
+
+    Deselecting them with a default `-m` in the config would make every other
+    `-m` the caller passes override it, so the gate is here instead — a test
+    marked `live` is skipped unless `live` was asked for by name.
+    """
+    if "live" in (config.getoption("-m") or ""):
+        return
+    skip_live = pytest.mark.skip(reason="live source test; run with -m live")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _point_at_the_test_database():
     """Session-wide, and before anything can open a pool against the real DSN."""
