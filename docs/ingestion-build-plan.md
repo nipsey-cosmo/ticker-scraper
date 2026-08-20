@@ -25,9 +25,13 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 
 | Part | Branch | Base | Commits | State |
 |---|---|---|---|---|
-| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 0 / 5 | not started |
-| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | blocked on 1 |
+| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
+| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | ready |
 | 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | blocked on 2 |
+
+Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
+`eslint` clean. Live smoke on 5100/3100 passed — all seven news sources
+returned articles, real OHLCV stored, no console errors on `/` or `/graphs`.
 
 ---
 
