@@ -658,7 +658,7 @@ tests.
 
 ### 3.5 — B6 + B7 · Insider aggregates and EDGAR full-text
 
-- [ ] `feat: count insider filings and search what other filings say about us`
+- [x] `feat: count insider filings and search what other filings say about us`
 
 **Files** `backend/services/news/sec_edgar.py`, `backend/db/connection.py`,
 `backend/routes/stocks.py`, `backend/tests/test_news_sources.py`

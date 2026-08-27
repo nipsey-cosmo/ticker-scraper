@@ -17,7 +17,17 @@ constructed from the company name and the form.
 
 **Most filings are noise.** Forms 3/4/5 and 144 are routine insider paperwork,
 dozens a month, and would swamp a feed. Only the forms that move a price are
-kept — see `_MATERIAL_FORMS`.
+kept — see `_MATERIAL_FORMS`. The insider forms are not discarded, though:
+they are *counted* into `db.insiders` on the way past, because "four insider
+filings this month" is real signal in a badge even though it is noise in a
+feed.
+
+**Full-text search finds what the submissions feed cannot.** A company's own
+filings are only half its regulatory footprint: a customer's 10-K naming it as
+a supply concentration risk is filed by the customer, appears under the
+customer's CIK, and shows up in no news feed anywhere. `efts.sec.gov` indexes
+the text of every filing, so it can be asked who else has been writing about
+this company.
 
 **`filings.recent` is columnar.** Not a list of filings but a dict of parallel
 lists — one for forms, one for dates, one for documents — so a row has to be
@@ -35,13 +45,15 @@ import json
 import threading
 
 import settings
-from normalize import parse_datetime
+from normalize import day_str, days_ago_iso, parse_datetime
 
 from ..http_client import scraper
 
 SOURCE_TYPE = "SEC_EDGAR"
+FULLTEXT_TYPE = "SEC_FULLTEXT"
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+_FULLTEXT_URL = "https://efts.sec.gov/LATEST/search-index"
 
 _MAX_ENTRIES = 25
 # `recent` carries up to a thousand filings and most of them are form 4s.
@@ -66,6 +78,16 @@ _MATERIAL_FORMS = (
     "S-3",      # shelf registration
     "424B",     # prospectus supplement, i.e. an actual raise
 )
+
+# Counted, never published. Prefixes again, so 4/A comes along with 4.
+_INSIDER_FORMS = ("3", "4", "5", "13F")
+
+# Full-text hits worth surfacing. An annual or quarterly report naming another
+# company is the concentration-risk case; a proxy or an 8-K naming one is
+# usually a business relationship. Insider forms are excluded here too — a
+# form 4 mentioning a company is its own filer's paperwork, not news about it.
+_FULLTEXT_FORMS = ("10-K", "10-Q", "8-K", "20-F", "DEF 14A")
+_FULLTEXT_MAX = 10
 
 _cik_by_ticker: dict[str, int] = {}
 _cik_lock = threading.Lock()
@@ -100,8 +122,13 @@ def cik_for(ticker: str) -> int | None:
         return _cik_by_ticker.get(ticker.upper())
 
 
-def fetch(ticker: str, company_name: str) -> list[dict]:
-    """`ticker` is the plain US symbol; the CIK map resolves it."""
+def fetch(ticker: str, company_name: str,
+          short_name: str | None = None) -> list[dict]:
+    """`ticker` is the plain US symbol; the CIK map resolves it.
+
+    `short_name` is only needed to file the insider counts; without it the
+    filings still come back and the counting is skipped.
+    """
     if not settings.sec_enabled():
         return []
 
@@ -113,7 +140,59 @@ def fetch(ticker: str, company_name: str) -> list[dict]:
     response = scraper.get(_SUBMISSIONS_URL.format(cik=cik), headers=headers())
     if not response or not response.ok:
         return []
-    return parse(response.text, company_name or ticker)
+
+    try:
+        data = json.loads(response.text)
+    except ValueError:
+        return []
+
+    if short_name:
+        _store_insider_counts(short_name, data)
+    return parse_data(data, company_name or ticker)
+
+
+def _store_insider_counts(short_name: str, data: dict) -> None:
+    """Telemetry-grade: a failure here must not cost the refresh its filings."""
+    try:
+        import db
+        db.insiders.record_counts(short_name, insider_counts(data))
+    except Exception as exc:
+        print(f"[edgar] could not record insider counts for {short_name}: "
+              f"{type(exc).__name__}: {exc}")
+
+
+def insider_counts(data: dict) -> dict[tuple[str, str], int]:
+    """{(YYYY-MM, form): filings} for the insider paperwork in this payload.
+
+    Scans the same bounded slice `parse_data` does, so the two always agree
+    about which filings they have seen, and counts by filing date rather than
+    acceptance time — a form 4 accepted after midnight belongs to the day it
+    reports on.
+    """
+    recent = ((data.get("filings") or {}).get("recent")) or {}
+    counts: dict[tuple[str, str], int] = {}
+
+    for index, raw_form in enumerate((recent.get("form") or [])[:_MAX_SCAN]):
+        form = _insider_form(str(raw_form or "").strip())
+        if not form:
+            continue
+        filed = str(_at(recent, "filingDate", index) or "")[:7]
+        if len(filed) != 7:
+            continue
+        counts[(filed, form)] = counts.get((filed, form), 0) + 1
+
+    return counts
+
+
+def _insider_form(form: str) -> str | None:
+    """'4/A' -> '4'. Amendments count with the form they amend."""
+    if not form:
+        return None
+    upper = form.upper()
+    for prefix in _INSIDER_FORMS:
+        if upper == prefix or upper.startswith(prefix + "/") or upper.startswith(prefix + "-"):
+            return prefix
+    return None
 
 
 def parse(payload: str, company_name: str) -> list[dict]:
@@ -122,7 +201,10 @@ def parse(payload: str, company_name: str) -> list[dict]:
         data = json.loads(payload)
     except ValueError:
         return []
+    return parse_data(data, company_name)
 
+
+def parse_data(data: dict, company_name: str) -> list[dict]:
     recent = ((data.get("filings") or {}).get("recent")) or {}
     cik = data.get("cik")
     forms = recent.get("form") or []
@@ -194,3 +276,112 @@ def _title(company_name: str, form: str, form_name: str) -> str:
     """
     suffix = f": {form_name}" if form_name else ""
     return f"{company_name} filed {form}{suffix}"
+
+
+# ── Full-text search: filings that mention us but are not ours ───────────
+
+def full_text(ticker: str, company_name: str, days: int = 7) -> list[dict]:
+    """Filings by *other* companies that name this one.
+
+    The submissions feed answers "what has this company filed". This answers
+    the other half: who else has been writing about it. A customer naming a
+    supplier as a concentration risk in its 10-K is filed under the customer's
+    CIK, appears in no news feed anywhere, and is exactly the kind of thing a
+    holder would want to know.
+
+    The company's own filings are excluded — they already arrive through
+    `fetch`, and storing them twice would be one story under two source types.
+    """
+    if not settings.sec_enabled() or not company_name:
+        return []
+
+    own_cik = cik_for(ticker)
+    response = scraper.get(_FULLTEXT_URL, params={
+        # Quoted, so the phrase matches as a phrase. Unquoted, "Rocket Lab"
+        # matches every filing containing "rocket" or "lab", which is the
+        # over-broad search that made GDELT unusable in this package.
+        "q": f'"{company_name}"',
+        "forms": ",".join(_FULLTEXT_FORMS),
+        "dateRange": "custom",
+        "startdt": days_ago_iso(days)[:10],
+        "enddt": day_str(),
+    }, headers=headers())
+
+    if not response or not response.ok:
+        return []
+    return parse_full_text(response.text, company_name, own_cik)
+
+
+def parse_full_text(payload: str, company_name: str,
+                    own_cik: int | None) -> list[dict]:
+    """Split from `full_text` so it can be tested against a saved payload."""
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return []
+
+    hits = ((data.get("hits") or {}).get("hits")) or []
+    articles = []
+
+    for hit in hits:
+        if len(articles) >= _FULLTEXT_MAX:
+            break
+        if not isinstance(hit, dict):
+            continue
+        source = hit.get("_source") or {}
+        if not isinstance(source, dict):
+            continue
+
+        ciks = [_int_or_none(c) for c in (source.get("ciks") or [])]
+        if own_cik is not None and own_cik in ciks:
+            continue                    # our own filing, already in the feed
+
+        filer = _filer_name(source)
+        form = str(source.get("file_type") or source.get("root_form") or "").strip()
+        url = _fulltext_url(hit.get("_id"), ciks)
+        if not filer or not form or not url:
+            continue
+
+        articles.append({
+            # Names both companies on purpose: the stock so the relevance
+            # filter keeps it, and the filer so the headline says who said it.
+            "title": f"{filer} names {company_name} in its {form}",
+            "url": url,
+            "published_at": parse_datetime(source.get("file_date")),
+            "description": None,
+            "image": None,
+            "source": "SEC EDGAR full-text",
+            "source_domain": "sec.gov",
+            "source_type": FULLTEXT_TYPE,
+        })
+
+    return articles
+
+
+def _filer_name(source: dict) -> str:
+    """`display_names` is ["Acme Corp  (ACME)  (CIK 0000123)"] — the name is
+    everything before the first bracketed part."""
+    names = source.get("display_names") or []
+    if not names:
+        return ""
+    return str(names[0]).split("  (")[0].strip()
+
+
+def _fulltext_url(hit_id, ciks: list) -> str | None:
+    """`_id` is "0000123456-26-000001:doc.htm"; the archive path needs the
+    accession without dashes and a CIK to hang it off."""
+    if not hit_id or not ciks or ciks[0] is None:
+        return None
+    accession, _, document = str(hit_id).partition(":")
+    if not accession:
+        return None
+    folder = accession.replace("-", "")
+    base = f"https://www.sec.gov/Archives/edgar/data/{ciks[0]}/{folder}"
+    return f"{base}/{document}" if document else f"{base}/{accession}-index.htm"
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

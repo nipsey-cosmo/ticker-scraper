@@ -10,6 +10,7 @@ import json
 import threading
 from types import SimpleNamespace
 
+import settings
 from services.news import bing_news, nasdaq_news, publishers, sec_edgar
 
 # Bing wraps every link in an apiclick redirect that carries the real URL in a
@@ -296,7 +297,7 @@ class TestCollectionAccounting:
             (news_pkg.bing_news, ("fetch",)),
             (news_pkg.finviz, ("fetch",)),
             (news_pkg.nasdaq_news, ("fetch",)),
-            (news_pkg.sec_edgar, ("fetch",)),
+            (news_pkg.sec_edgar, ("fetch", "full_text")),
             (news_pkg.wires, ("for_stock",)),
         ):
             for name in names:
@@ -312,7 +313,8 @@ class TestCollectionAccounting:
 
         rows = {r["source_type"]: r for r in db.sources.yields()}
         assert set(rows) == {"GOOGLE_NEWS", "YAHOO_SEARCH", "YAHOO_RSS",
-                             "BING_NEWS", "WIRES", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
+                             "BING_NEWS", "WIRES", "FINVIZ", "NASDAQ",
+                             "SEC_EDGAR", "SEC_FULLTEXT"}
         assert all(r["fetches"] == 1 and r["skips"] == 0 for r in rows.values())
 
     def test_a_london_listing_records_the_us_sources_as_skipped(self, temp_db, monkeypatch):
@@ -325,7 +327,7 @@ class TestCollectionAccounting:
         news_pkg.collect("SHEL", "Shell plc", "SHEL.L", "LSE")
 
         rows = {r["source_type"]: r for r in db.sources.yields()}
-        for source in ("FINVIZ", "NASDAQ", "SEC_EDGAR"):
+        for source in ("FINVIZ", "NASDAQ", "SEC_EDGAR", "SEC_FULLTEXT"):
             assert rows[source]["skips"] == 1, source
             assert rows[source]["fetches"] == 0, source
             assert rows[source]["stalled"] is False, source
@@ -339,8 +341,10 @@ class TestCollectionAccounting:
 
         news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS")
 
-        edgar = {r["source_type"]: r for r in db.sources.yields()}["SEC_EDGAR"]
-        assert edgar["skips"] == 1 and edgar["fetches"] == 0
+        yields = {r["source_type"]: r for r in db.sources.yields()}
+        for source in ("SEC_EDGAR", "SEC_FULLTEXT"):
+            assert yields[source]["skips"] == 1, source
+            assert yields[source]["fetches"] == 0, source
 
     def test_a_source_that_raises_is_counted_as_a_barren_fetch(self, temp_db, monkeypatch):
         """It went out and produced nothing, which is exactly what `stalled`
@@ -429,3 +433,224 @@ class TestFastLane:
 
         jobs.refresh_news()
         assert detected
+
+
+# ── Insider counters and EDGAR full-text (3.5) ───────────────────────────
+
+def submissions_payload(forms, dates=None, cik=320193):
+    """A columnar `filings.recent` block, the shape data.sec.gov actually
+    returns: parallel lists, not a list of filings."""
+    dates = dates or ["2026-08-14"] * len(forms)
+    return json.dumps({
+        "cik": cik,
+        "filings": {"recent": {
+            "form": forms,
+            "filingDate": dates,
+            "acceptanceDateTime": [f"{d}T20:14:00.000Z" for d in dates],
+            "accessionNumber": [f"0000320193-26-{i:06d}" for i in range(len(forms))],
+            "primaryDocument": ["doc.htm"] * len(forms),
+            "primaryDocDescription": [""] * len(forms),
+        }},
+    })
+
+
+class TestInsiderCounters:
+    """Forms 3/4/5 were arriving in the same payload as the 8-Ks and being
+    dropped on the floor. They stay out of the feed — dozens a month would
+    swamp it, which is why they were filtered in the first place — but "four
+    insider filings this month" is a badge worth keeping."""
+
+    def test_form_4s_are_counted_and_never_published(self, temp_db):
+        import db
+
+        payload = submissions_payload(["4", "4", "8-K", "4", "3"])
+        data = json.loads(payload)
+
+        articles = sec_edgar.parse_data(data, "Apple Inc.")
+        counts = sec_edgar.insider_counts(data)
+
+        # The 8-K is the only thing that reaches the feed.
+        assert [a["title"] for a in articles] == ["Apple Inc. filed 8-K"]
+        assert counts == {("2026-08", "4"): 3, ("2026-08", "3"): 1}
+
+    def test_amendments_count_with_the_form_they_amend(self):
+        counts = sec_edgar.insider_counts(
+            json.loads(submissions_payload(["4", "4/A", "5"])))
+        assert counts == {("2026-08", "4"): 2, ("2026-08", "5"): 1}
+
+    def test_13f_is_counted_too(self):
+        counts = sec_edgar.insider_counts(
+            json.loads(submissions_payload(["13F-HR", "13F-HR/A"])))
+        assert counts == {("2026-08", "13F"): 2}
+
+    def test_material_forms_are_not_counted_as_insider_paperwork(self):
+        assert sec_edgar.insider_counts(
+            json.loads(submissions_payload(["8-K", "10-Q", "424B5"]))) == {}
+
+    def test_counts_are_grouped_by_filing_month(self):
+        counts = sec_edgar.insider_counts(json.loads(submissions_payload(
+            ["4", "4", "4"], dates=["2026-08-14", "2026-08-02", "2026-07-30"])))
+        assert counts == {("2026-08", "4"): 2, ("2026-07", "4"): 1}
+
+    def test_recounting_does_not_double(self, temp_db):
+        """It runs on every refresh, and the counts are absolute rather than
+        incremental precisely so that re-running it is a no-op."""
+        import db
+
+        counts = {("2026-08", "4"): 3}
+        db.insiders.record_counts("AAPL", counts)
+        db.insiders.record_counts("AAPL", counts)
+
+        stored = db.insiders.get_activity("AAPL")
+        assert [(r["month"], r["form"], r["filings"]) for r in stored] \
+            == [("2026-08", "4", 3)]
+
+    def test_a_month_falling_out_of_the_scan_keeps_its_high_water_mark(self, temp_db):
+        """The scan is a bounded slice, so an old month's count would decay
+        towards zero as new filings push it out. It must not."""
+        import db
+
+        db.insiders.record_counts("AAPL", {("2026-07", "4"): 9})
+        db.insiders.record_counts("AAPL", {("2026-07", "4"): 2})
+
+        assert db.insiders.get_activity("AAPL")[0]["filings"] == 9
+
+    def test_a_growing_month_is_updated(self, temp_db):
+        import db
+
+        db.insiders.record_counts("AAPL", {("2026-08", "4"): 2})
+        db.insiders.record_counts("AAPL", {("2026-08", "4"): 5})
+
+        assert db.insiders.get_activity("AAPL")[0]["filings"] == 5
+
+    def test_fetch_files_the_counts_and_returns_only_the_feed(self, temp_db, monkeypatch):
+        import db
+
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        monkeypatch.setattr(sec_edgar, "cik_for", lambda t: 320193)
+        monkeypatch.setattr(sec_edgar.scraper, "get", lambda *a, **kw: SimpleNamespace(
+            ok=True, text=submissions_payload(["4", "8-K", "4"])))
+
+        articles = sec_edgar.fetch("AAPL", "Apple Inc.", short_name="AAPL")
+
+        assert len(articles) == 1 and articles[0]["source_type"] == "SEC_EDGAR"
+        assert db.insiders.get_activity("AAPL")[0]["filings"] == 2
+
+    def test_a_counter_failure_never_costs_the_filings(self, monkeypatch, capsys):
+        """Telemetry-grade: a bad write must not take the 8-K down with it."""
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        monkeypatch.setattr(sec_edgar, "cik_for", lambda t: 320193)
+        monkeypatch.setattr(sec_edgar.scraper, "get", lambda *a, **kw: SimpleNamespace(
+            ok=True, text=submissions_payload(["4", "8-K"])))
+        monkeypatch.setattr(sec_edgar, "insider_counts",
+                            lambda data: (_ for _ in ()).throw(RuntimeError("nope")))
+
+        articles = sec_edgar.fetch("AAPL", "Apple Inc.", short_name="AAPL")
+
+        assert len(articles) == 1
+        assert "could not record insider counts" in capsys.readouterr().out
+
+    def test_the_route_serves_the_counters(self, client, temp_db):
+        import db
+
+        db.insiders.record_counts("AAPL", {("2026-08", "4"): 4, ("2026-07", "4"): 1})
+
+        body = client.get("/stocks/AAPL/insiders").json()
+        assert [r["month"] for r in body["results"]] == ["2026-08", "2026-07"]
+        assert body["results"][0]["filings"] == 4
+
+
+def fulltext_payload(hits):
+    """`hits` is [(filer_display, cik, form)]."""
+    return json.dumps({"hits": {"hits": [
+        {
+            "_id": f"0000{cik}-26-00000{i}:doc.htm",
+            "_source": {
+                "display_names": [f"{filer}  (XYZ)  (CIK 000000{cik})"],
+                "ciks": [str(cik)],
+                "file_type": form,
+                "file_date": "2026-08-25",
+            },
+        }
+        for i, (filer, cik, form) in enumerate(hits)
+    ]}})
+
+
+class TestEdgarFullText:
+    """The submissions feed answers "what has this company filed". This answers
+    the other half: who else has been writing about it. A customer naming a
+    supplier as a concentration risk is filed under the customer's CIK and
+    appears in no news feed anywhere."""
+
+    def test_a_hit_naming_another_filer_is_attributed_to_the_right_stock(self):
+        articles = sec_edgar.parse_full_text(
+            fulltext_payload([("Beta Motors Inc", 999888, "10-K")]),
+            "Rocket Lab", own_cik=320193)
+
+        assert len(articles) == 1
+        item = articles[0]
+        # Both names: the stock so the relevance filter keeps it, the filer so
+        # the headline says who said it.
+        assert item["title"] == "Beta Motors Inc names Rocket Lab in its 10-K"
+        assert item["source_type"] == "SEC_FULLTEXT"
+        assert "999888" in item["url"]
+
+    def test_the_companys_own_filings_are_excluded(self):
+        """They already arrive through `fetch`; storing them again would be one
+        story under two source types."""
+        articles = sec_edgar.parse_full_text(
+            fulltext_payload([("Apple Inc", 320193, "10-K"),
+                              ("Beta Motors Inc", 999888, "10-K")]),
+            "Apple Inc.", own_cik=320193)
+
+        assert [a["title"] for a in articles] \
+            == ["Beta Motors Inc names Apple Inc. in its 10-K"]
+
+    def test_an_unknown_own_cik_keeps_everything(self):
+        """Not resolving our CIK is a reason to show more, not to show nothing."""
+        articles = sec_edgar.parse_full_text(
+            fulltext_payload([("Apple Inc", 320193, "10-K")]),
+            "Apple Inc.", own_cik=None)
+        assert len(articles) == 1
+
+    def test_the_filer_name_is_stripped_of_its_bracketed_tail(self):
+        articles = sec_edgar.parse_full_text(
+            fulltext_payload([("Beta Motors Inc", 999888, "8-K")]),
+            "Rocket Lab", own_cik=None)
+        assert articles[0]["title"].startswith("Beta Motors Inc names")
+
+    def test_malformed_hits_are_skipped_not_raised(self):
+        payload = json.dumps({"hits": {"hits": [
+            "not a dict", {}, {"_source": "not a dict"},
+            {"_source": {"display_names": [], "ciks": ["1"], "file_type": "10-K"}},
+        ]}})
+        assert sec_edgar.parse_full_text(payload, "Rocket Lab", None) == []
+
+    def test_a_non_json_body_is_empty_not_an_exception(self):
+        assert sec_edgar.parse_full_text("<html>bot check</html>", "X", None) == []
+
+    def test_the_phrase_is_quoted_in_the_query(self, monkeypatch):
+        """Unquoted, "Rocket Lab" matches every filing containing "rocket" or
+        "lab" — the over-broad search that made GDELT unusable here."""
+        sent = {}
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        monkeypatch.setattr(sec_edgar, "cik_for", lambda t: 320193)
+
+        def capture(url, params=None, **kw):
+            sent.update(params or {})
+            return SimpleNamespace(ok=True, text=fulltext_payload([]))
+
+        monkeypatch.setattr(sec_edgar.scraper, "get", capture)
+        sec_edgar.full_text("RKLB", "Rocket Lab")
+
+        assert sent["q"] == '"Rocket Lab"'
+        assert "10-K" in sent["forms"]
+
+    def test_it_declines_itself_without_a_contact_address(self, monkeypatch):
+        """Same rule as the rest of EDGAR: the SEC asked to know who we are."""
+        called = []
+        monkeypatch.setattr(settings, "SEC_CONTACT", "")
+        monkeypatch.setattr(sec_edgar.scraper, "get", lambda *a, **kw: called.append(1))
+
+        assert sec_edgar.full_text("RKLB", "Rocket Lab") == []
+        assert called == []

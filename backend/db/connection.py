@@ -224,6 +224,26 @@ CREATE TABLE IF NOT EXISTS events (
     move_volume_x    DOUBLE PRECISION  -- window's volume vs a median 5m bar
 );
 
+-- Insider paperwork, counted rather than published.
+--
+-- Forms 3/4/5 arrive in the same submissions payload as the 8-Ks and were
+-- being thrown away. They are dozens a month and would swamp the feed, which
+-- is why they are filtered out of it — but "four insiders sold this month" is
+-- a real signal, it is just a badge rather than a headline. 13F is the same
+-- shape at quarterly cadence.
+--
+-- Counts are absolute, not incremental: a refresh recounts the filings in the
+-- scanned window and writes the total, so re-running it is a no-op instead of
+-- doubling every number.
+CREATE TABLE IF NOT EXISTS insider_activity (
+    short_name TEXT NOT NULL,
+    month      TEXT NOT NULL,               -- YYYY-MM UTC
+    form       TEXT NOT NULL,               -- '3' | '4' | '5' | '13F'
+    filings    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT {_NOW},
+    PRIMARY KEY (short_name, month, form)
+);
+
 -- How much each news source actually returned, per day.
 --
 -- In the database rather than a process counter because the refreshes run in

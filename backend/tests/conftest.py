@@ -62,7 +62,7 @@ def temp_db():
         conn.execute(
             "TRUNCATE stocks, news, prices, splits, dividends, watchlist,"
             " stock_sentiment_history, stock_ai_summaries, events, app_config,"
-            " source_yield RESTART IDENTITY"
+            " source_yield, insider_activity RESTART IDENTITY"
         )
     # Truncating app_config resets the flags, but the rejected-key latch lives
     # in a module global — without this a test that trips it silently disables

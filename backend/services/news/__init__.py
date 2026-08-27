@@ -4,6 +4,7 @@ Seven fetches across five independent operators, so no single company's outage
 or rate limit can take the feed down:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
+    EDGAR search  filings by *other* companies that name this one (US, opt-in)
     Newswires     the company's own release, which every article rewrites
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
@@ -95,12 +96,20 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
         # instead.
         if settings.sec_enabled():
             tasks.append((sec_edgar.SOURCE_TYPE,
-                          lambda: sec_edgar.fetch(us_ticker, company_name)))
+                          lambda: sec_edgar.fetch(us_ticker, company_name,
+                                                  short_name=short_name)))
+            # Deliberately not in FAST_SOURCES. A filing naming somebody else's
+            # supplier is not a minutes-matter event, and the full-text index
+            # is a heavier query than a submissions lookup, so it rides the
+            # hourly lane only.
+            tasks.append((sec_edgar.FULLTEXT_TYPE,
+                          lambda: sec_edgar.full_text(us_ticker, company_name,
+                                                      days=days)))
         else:
-            skipped.add(sec_edgar.SOURCE_TYPE)
+            skipped.update({sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
     else:
         skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
-                        sec_edgar.SOURCE_TYPE})
+                        sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
 
     if only is not None:
         tasks = [task for task in tasks if task[0] in only]
