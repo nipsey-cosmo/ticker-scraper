@@ -626,7 +626,7 @@ URLs do not.
 
 ### 3.4 — A2 · curl_cffi transport
 
-- [ ] `feat: allow a browser TLS fingerprint when a host starts refusing`
+- [x] `feat: allow a browser TLS fingerprint when a host starts refusing`
 
 **Files** `backend/services/http_client.py`, `backend/settings.py`,
 `pyproject.toml`, `backend/tests/test_http_client.py`

@@ -123,6 +123,19 @@ EMBED_MODEL = os.getenv("STOCKY_EMBED_MODEL", "").strip()
 # way except the fact they report.
 EMBED_SIMILARITY = _float("STOCKY_EMBED_SIMILARITY", 0.82)
 
+# ── Scraper transport ────────────────────────────────────────────────────
+# httpx negotiates TLS through OpenSSL, and that ClientHello has been in
+# anti-bot fingerprint databases since 2017. A host behind Cloudflare Bot
+# Management can therefore refuse at the handshake, before it has read a single
+# one of our carefully rotated headers. Two are doing it right now: stooq.com
+# answers its CSV endpoint with a 200 carrying a browser-check page, and
+# accessnewswire.com returns a flat 403.
+#
+# Set to a curl_cffi target ("chrome", "safari", "firefox", or a pinned version
+# like "chrome131") to present a real browser fingerprint instead. Empty — the
+# default — keeps httpx, so this changes nothing until it is asked for.
+SCRAPE_IMPERSONATE = os.getenv("STOCKY_SCRAPE_IMPERSONATE", "").strip()
+
 # SEC's fair-access policy requires every caller to identify itself with a
 # contact address, and it is enforced, not advisory: a User-Agent carrying a
 # repo URL instead of an email gets a flat 403 while the same request with an
