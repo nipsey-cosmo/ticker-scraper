@@ -243,6 +243,15 @@ def refresh_watchlist(days: int = 2, only: frozenset[str] | None = None,
         except Exception as exc:
             print(f"[news] {short_name} failed: {type(exc).__name__}: {exc}")
 
+    # After every stock, never per stock: a cross-stock link needs the other
+    # stocks' rows to already be there, so linking inside the loop would only
+    # ever connect the tickers that happened to refresh first. Cheap enough to
+    # run on the fast lane too — a filing naming two of your holdings is
+    # exactly the story worth connecting the minute it lands.
+    linked = db.news.link_stories()
+    if linked:
+        print(f"[news] linked {linked} row(s) into cross-stock stories")
+
     # Both cost a fetch per article and a filing carries no image, so the
     # fast lane stores and moves on. Pruning is a daily concern either way.
     if only is None:

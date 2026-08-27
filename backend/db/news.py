@@ -361,3 +361,57 @@ def source_breakdown(short_names: list[str], since: str) -> list[dict]:
             WHERE short_name IN ({marks}) AND publish_time >= %s
             GROUP BY 1 ORDER BY article_count DESC, source
         """, [*short_names, since]))
+
+
+# ── Cross-stock story linking ────────────────────────────────────────────
+
+def link_stories(days: int = 7) -> int:
+    """Give every copy of one story, across stocks, a shared `story_id`.
+
+    Dedup is scoped to a single stock on purpose, so a supplier story affecting
+    three holdings is stored three times with nothing connecting them. This
+    connects them, and it runs *after* storage: it labels rows that already
+    exist and changes no clustering decision, which is what makes it incapable
+    of costing the filter an article.
+
+    Matched on `url_hash` alone — the identical canonical URL filed under two
+    tickers. Fuzzy matching across stocks is precisely what broke the original
+    build ("Stock Market Today: Nasdaq Rises" for NVDA blocking the TSLA copy),
+    and a semantic version of that mistake would be harder to spot, not easier.
+
+    The group id is the earliest row's id: a real news id, stable as long as
+    that row lives, so re-running this is a no-op rather than a reshuffle.
+
+    `days` bounds the work, not the group. The window picks which hashes to
+    look at; the grouping then spans every row carrying them, so a story does
+    not get a new id the day its first copy ages out of the window.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            UPDATE news SET story_id = grouped.story_id
+            FROM (
+                -- Postgres has no MIN(uuid). The text form of a UUID is
+                -- fixed-width lowercase hex, so it sorts identically to the
+                -- binary value and the cast costs nothing but a round trip
+                -- through varchar.
+                SELECT url_hash, MIN(id::text)::uuid AS story_id
+                FROM news
+                WHERE url_hash IN (
+                    SELECT url_hash FROM news
+                    WHERE publish_time >= %s AND url_hash IS NOT NULL
+                )
+                GROUP BY url_hash
+                HAVING COUNT(DISTINCT short_name) > 1
+            ) AS grouped
+            WHERE news.url_hash = grouped.url_hash
+              AND news.story_id IS DISTINCT FROM grouped.story_id
+        """, (days_ago_iso(days),)).rowcount
+
+
+def get_story(story_id: UUID) -> list[dict]:
+    """Every stock's copy of one story, oldest first."""
+    with get_connection() as conn:
+        return rows(conn.execute(
+            "SELECT * FROM news WHERE story_id = %s ORDER BY publish_time ASC, id ASC",
+            (story_id,),
+        ))

@@ -605,7 +605,7 @@ stories about one stock do not.
 
 ### 3.3 — D3 · Cross-stock story linking
 
-- [ ] `feat: link one story across every stock it touches`
+- [x] `feat: link one story across every stock it touches`
 
 **Files** `backend/db/connection.py`, `backend/services/news/__init__.py`,
 `backend/routes/news.py`, `backend/tests/test_dedup.py`

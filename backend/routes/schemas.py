@@ -79,6 +79,9 @@ class NewsArticle(BaseModel):
     impact: Optional[str] = None
     # Only set on /news/trending, where the ranking is the stock's price move.
     movePercent: Optional[float] = None
+    # Shared by every stock this one story touches. None is the common case:
+    # most stories are about a single company.
+    storyId: Optional[UUID] = None
 
 
 class NewsList(BaseModel):
@@ -305,6 +308,7 @@ def to_news(row: dict) -> NewsArticle:
         ai_summary=row.get("ai_summary"),
         impact=row.get("impact"),
         movePercent=row.get("move_percent"),
+        storyId=row.get("story_id"),
     )
 
 

@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS news (
     id             UUID PRIMARY KEY DEFAULT uuidv7(),
     created_at     TEXT NOT NULL DEFAULT {_NOW},
     short_name     TEXT NOT NULL,
+    -- Shared by every row carrying the same canonical URL for a different
+    -- stock. NULL means this story touches one stock, which is most of them.
+    story_id       UUID,
     source         TEXT NOT NULL,
     source_url     TEXT,
     source_domain  TEXT,
@@ -316,6 +319,16 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS move_from_ts  TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS move_to_ts    TEXT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS move_percent  DOUBLE PRECISION;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS move_volume_x DOUBLE PRECISION;
+
+-- One story, every stock it touches. Dedup is scoped to a single stock by
+-- design, so a supplier story affecting three holdings is three rows with
+-- nothing connecting them. This is assigned *after* storage and changes no
+-- clustering decision: it is a label on rows that already exist, which is what
+-- makes it zero risk to the filter that produced them.
+--
+-- Holds the id of the earliest row in the group, so it is a real news id
+-- rather than a synthetic key, and re-running the assignment is a no-op.
+ALTER TABLE news ADD COLUMN IF NOT EXISTS story_id UUID;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for
@@ -333,6 +346,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_news_stock_url    ON news(short_name, url_
 CREATE INDEX        IF NOT EXISTS idx_news_stock_time   ON news(short_name, publish_time DESC);
 CREATE INDEX        IF NOT EXISTS idx_news_time         ON news(publish_time DESC);
 CREATE INDEX        IF NOT EXISTS idx_news_stock_key    ON news(short_name, title_key);
+CREATE INDEX        IF NOT EXISTS idx_news_url_hash     ON news(url_hash);
+CREATE INDEX        IF NOT EXISTS idx_news_story        ON news(story_id) WHERE story_id IS NOT NULL;
 CREATE INDEX        IF NOT EXISTS idx_prices_stock_ts   ON prices(short_name, ts);
 CREATE INDEX        IF NOT EXISTS idx_summaries_stock   ON stock_ai_summaries(short_name, created_at DESC);
 CREATE INDEX        IF NOT EXISTS idx_events_stock_time  ON events(short_name, created_at DESC);

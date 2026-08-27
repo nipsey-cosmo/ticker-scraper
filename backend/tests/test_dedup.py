@@ -544,3 +544,134 @@ def _key(text: str, mapping: dict) -> str:
         if text.startswith(known):
             return known
     return text
+
+
+# ── Cross-stock story linking (3.3) ──────────────────────────────────────
+
+class TestStoryLinking:
+    """Dedup is scoped to one stock by design, so a supplier story affecting
+    three holdings is three rows with nothing connecting them.
+
+    Linking runs *after* storage and matches on `url_hash` alone. Both are
+    deliberate: it labels rows that already exist, so it cannot cost the filter
+    an article, and fuzzy cross-stock matching is exactly what broke the
+    original build.
+    """
+
+    @staticmethod
+    def _store(pairs):
+        """`pairs` is [(short_name, url_hash)]. Returns the inserted ids."""
+        import db
+        from normalize import now_iso
+
+        return db.news.insert_news_many([{
+            "short_name": short_name,
+            "title": f"Chip supply deal reshapes {short_name} outlook",
+            "title_key": f"chip-{short_name}-{url_hash_}",
+            "url": f"https://reuters.com/{url_hash_}",
+            "url_hash": url_hash_,
+            "source": "Reuters", "source_domain": "reuters.com",
+            "source_type": "GOOGLE_NEWS", "publish_time": now_iso(),
+        } for short_name, url_hash_ in pairs])
+
+    def test_one_url_across_three_stocks_shares_a_story_id(self, temp_db):
+        import db
+
+        self._store([("NVDA", "supply"), ("TSM", "supply"), ("AMD", "supply")])
+
+        assert db.news.link_stories() == 3
+
+        stored = db.news.get_news(["NVDA", "TSM", "AMD"], limit=10)
+        ids = {row["story_id"] for row in stored}
+        assert len(ids) == 1 and None not in ids
+
+    def test_different_urls_are_not_linked(self, temp_db):
+        import db
+
+        self._store([("NVDA", "one"), ("TSM", "two")])
+
+        assert db.news.link_stories() == 0
+        assert all(row["story_id"] is None
+                   for row in db.news.get_news(["NVDA", "TSM"], limit=10))
+
+    def test_one_url_for_one_stock_is_not_a_story(self, temp_db):
+        """Most news is about a single company. A story_id on every row would
+        mean nothing, so the label only appears where it says something."""
+        import db
+
+        self._store([("NVDA", "solo")])
+
+        assert db.news.link_stories() == 0
+        assert db.news.get_news(["NVDA"], limit=10)[0]["story_id"] is None
+
+    def test_the_story_id_is_the_earliest_row(self, temp_db):
+        """A real news id rather than a synthetic key, so it stays meaningful
+        and re-running the assignment cannot reshuffle it."""
+        import db
+
+        ids = self._store([("NVDA", "supply"), ("TSM", "supply")])
+        db.news.link_stories()
+
+        stored = db.news.get_news(["NVDA", "TSM"], limit=10)
+        assert {row["story_id"] for row in stored} == {min(ids)}
+
+    def test_relinking_is_a_no_op(self, temp_db):
+        """It runs on every sweep, so a second pass must change no rows rather
+        than rewrite the same value over every article in the window."""
+        import db
+
+        self._store([("NVDA", "supply"), ("TSM", "supply")])
+
+        assert db.news.link_stories() == 2
+        assert db.news.link_stories() == 0
+
+    def test_a_late_arriving_copy_joins_the_existing_story(self, temp_db):
+        """The third holding's copy usually lands on a later sweep."""
+        import db
+
+        first = self._store([("NVDA", "supply"), ("TSM", "supply")])
+        db.news.link_stories()
+
+        self._store([("AMD", "supply")])
+        assert db.news.link_stories() == 1
+
+        stored = db.news.get_news(["NVDA", "TSM", "AMD"], limit=10)
+        assert {row["story_id"] for row in stored} == {min(first)}
+
+    def test_linking_changes_no_clustering_decision(self, temp_db):
+        """The whole safety argument: it labels rows, it never removes one."""
+        import db
+
+        self._store([("NVDA", "supply"), ("TSM", "supply"), ("AMD", "other")])
+        before = len(db.news.get_news(["NVDA", "TSM", "AMD"], limit=50))
+
+        db.news.link_stories()
+
+        assert len(db.news.get_news(["NVDA", "TSM", "AMD"], limit=50)) == before
+
+    def test_get_story_returns_every_stocks_copy(self, temp_db):
+        import db
+
+        self._store([("NVDA", "supply"), ("TSM", "supply")])
+        db.news.link_stories()
+        story_id = db.news.get_news(["NVDA"], limit=1)[0]["story_id"]
+
+        assert sorted(r["short_name"] for r in db.news.get_story(story_id)) \
+            == ["NVDA", "TSM"]
+
+    def test_the_story_route_serves_the_linked_set(self, client, temp_db):
+        import db
+
+        self._store([("NVDA", "supply"), ("TSM", "supply")])
+        db.news.link_stories()
+        story_id = db.news.get_news(["NVDA"], limit=1)[0]["story_id"]
+
+        body = client.get(f"/news/story/{story_id}").json()
+        assert sorted(r["short_name"] for r in body["results"]) == ["NVDA", "TSM"]
+        assert all(r["storyId"] == str(story_id) for r in body["results"])
+
+    def test_an_unlinked_story_id_is_an_empty_list_not_a_404(self, client):
+        """A story_id only exists once a story spans stocks, so "nothing here"
+        is a real answer rather than a missing resource."""
+        body = client.get("/news/story/0199a000-0000-7000-8000-000000000000").json()
+        assert body["results"] == []
