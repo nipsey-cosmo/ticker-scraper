@@ -64,6 +64,10 @@ def _try_hosts(hosts: list[str], path: str, params: dict, cache: bool = True) ->
     return None
 
 
+# Intervals fine enough that a cached response would be served as live.
+_INTRADAY = frozenset({"1m", "2m", "5m", "15m"})
+
+
 # ── Chart: quote + history in one request ────────────────────────────────
 
 def chart(symbol: str, range_: str = "1mo", interval: str = "1d") -> dict | None:
@@ -81,7 +85,7 @@ def chart(symbol: str, range_: str = "1mo", interval: str = "1d") -> dict | None
         _CHART_HOSTS,
         f"/v8/finance/chart/{symbol}",
         {"range": range_, "interval": interval, "includePrePost": "false", "events": "div,split"},
-        cache=(interval != "1m"),
+        cache=(interval not in _INTRADAY),
     )
     if not data:
         return None
@@ -152,6 +156,7 @@ def parse_chart(data: dict) -> dict | None:
     dividends, splits = _corporate_actions(node, divisor)
 
     return {
+        "session": _regular_session(meta),
         "symbol": meta.get("symbol"),
         "exchange": meta.get("exchangeName"),
         "exchange_name": meta.get("fullExchangeName"),
@@ -165,6 +170,23 @@ def parse_chart(data: dict) -> dict | None:
         "dividends": dividends,
         "splits": splits,
     }
+
+
+def _regular_session(meta: dict) -> dict | None:
+    """The exchange's regular hours for this payload, or None if not stated.
+
+    Yahoo is asked for `includePrePost=false` and mostly honours it, but a 5m
+    request still comes back with the odd pre-market bar attached. This is the
+    feed's own answer to "when was the bell", so it is what intraday storage
+    filters against rather than a hardcoded clock per exchange.
+    """
+    regular = (meta.get("currentTradingPeriod") or {}).get("regular")
+    if not isinstance(regular, dict):
+        return None
+    start, end = regular.get("start"), regular.get("end")
+    if start is None or end is None:
+        return None
+    return {"start": _iso_from_epoch(start), "end": _iso_from_epoch(end)}
 
 
 def _corporate_actions(node: dict, divisor: float) -> tuple[list[dict], list[dict]]:

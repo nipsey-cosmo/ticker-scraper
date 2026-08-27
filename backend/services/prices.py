@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import db
 import settings
-from normalize import days_ago_iso, now_utc, to_iso
+from normalize import days_ago_iso, markets_open, now_utc, to_iso
 
 from . import stooq, symbols, yahoo
 from .http_client import scraper
@@ -383,6 +383,84 @@ def _store_snapshot(short_name: str, price: float) -> None:
         return
     stamp = to_iso(now_utc().replace(minute=0, second=0, microsecond=0))
     db.prices.upsert_points(short_name, [(stamp, price)], interval="snap")
+
+
+# ── Intraday bars ────────────────────────────────────────────────────────
+
+# One trading day of 5m bars is ~78 rows. A day's range is all that is needed:
+# the fortnight of history builds up a day at a time from repeated calls, and
+# asking for more would re-download bars already stored on every tick.
+_INTRADAY_RANGE = "1d"
+
+
+def in_session(chart: dict) -> list[dict]:
+    """Bars that fall inside the exchange's regular hours.
+
+    `includePrePost=false` is already on the request and Yahoo mostly honours
+    it, but a 5m payload still arrives with the occasional pre-market bar. A
+    pre-market print on thin volume is exactly the kind of bar that would make
+    an event look like it moved the stock 3%, so it is dropped rather than
+    stored and reasoned about later.
+
+    A payload that does not state its session is stored whole — the feed's own
+    filter is then the only one we have, and dropping everything would be worse
+    than trusting it.
+    """
+    points = chart.get("points") or []
+    session = chart.get("session")
+    if not session:
+        return points
+    return [bar for bar in points
+            if session["start"] <= bar["ts"] <= session["end"]]
+
+
+def refresh_intraday(short_name: str) -> int:
+    """Today's 5m bars for one stock. Returns the number stored."""
+    stock = db.stocks.get_stock(short_name)
+    if not stock:
+        return 0
+    yahoo_symbol = ensure_resolved(stock)
+    if not yahoo_symbol:
+        return 0
+
+    chart = yahoo.chart(yahoo_symbol, range_=_INTRADAY_RANGE, interval=db.prices.INTRADAY)
+    if not chart:
+        return 0
+
+    bars = in_session(chart)
+    if not bars:
+        return 0
+    return db.prices.upsert_points(short_name, bars, interval=db.prices.INTRADAY)
+
+
+def refresh_watchlist_intraday() -> dict:
+    """Scheduled: 5m bars for every followed stock, while a market is open.
+
+    Session-gated at the top, and that gate is the feature rather than an
+    optimisation. Ungated this is an all-night poll returning the same flat
+    line: one request per stock per tick, all of them re-fetching bars already
+    on disk, for a price that cannot move.
+    """
+    if not markets_open():
+        return {"stored": 0, "skipped": "markets closed"}
+
+    watched = db.watchlist.get_symbols()
+    if not watched:
+        return {"stored": 0}
+
+    def one(short_name: str) -> int:
+        try:
+            return refresh_intraday(short_name)
+        except Exception as exc:                      # one bad symbol must not
+            print(f"[prices] intraday {short_name} errored: {exc}")   # stall the rest
+            return 0
+
+    workers = min(settings.SCRAPE_CONCURRENCY, len(watched))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="intraday") as pool:
+        stored = sum(pool.map(one, watched))
+
+    print(f"[prices] {stored} intraday bars over {len(watched)} stocks")
+    return {"stored": stored}
 
 
 def refresh_watchlist(range_: str = "5d") -> dict:

@@ -552,7 +552,7 @@ ticker and asserts a non-empty parse.
 
 ### 3.1 — C4 · Intraday bars and news-to-move attribution
 
-- [ ] `feat: pull 5m bars so an event can be checked against the move`
+- [x] `feat: pull 5m bars so an event can be checked against the move`
 
 **Files** `backend/services/yahoo.py`, `backend/services/prices.py`,
 `backend/db/prices.py`, `backend/services/events.py`,

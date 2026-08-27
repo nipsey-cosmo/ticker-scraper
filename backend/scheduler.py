@@ -22,6 +22,14 @@ scheduler.add_job(
     max_instances=1, coalesce=True,
 )
 
+# Intraday bars ride the same fast cadence as the quote, and skip themselves
+# outside session hours. Attribution rides along with them.
+scheduler.add_job(
+    jobs.refresh_intraday, "interval",
+    minutes=settings.PRICE_REFRESH_OPEN_MINUTES, id="intraday",
+    max_instances=1, coalesce=True,
+)
+
 scheduler.add_job(
     jobs.refresh_news, "interval",
     minutes=settings.NEWS_REFRESH_MINUTES, id="news",
@@ -65,6 +73,7 @@ def main() -> None:
     # Bring everything current on start rather than idling until the first tick.
     jobs.catch_up()
     jobs.refresh_prices()
+    jobs.refresh_intraday()
     jobs.refresh_news()
     jobs.aggregate_sentiment()
     jobs.refresh_earnings()

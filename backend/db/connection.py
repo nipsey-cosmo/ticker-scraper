@@ -208,7 +208,17 @@ CREATE TABLE IF NOT EXISTS events (
     previously_known TEXT,            -- NULL when genuinely fresh
     impact           TEXT NOT NULL,   -- 'high' | 'medium' | 'low'
     news_ids         UUID[] NOT NULL, -- backing articles
-    tokens_total     INTEGER NOT NULL DEFAULT 0
+    tokens_total     INTEGER NOT NULL DEFAULT 0,
+    -- What the stock did over the trading window that followed. A *window*,
+    -- never an instant: scraped publish timestamps are only good to the hour,
+    -- so `move_from_ts` and `move_to_ts` are stated rather than implied and no
+    -- consumer should read this as "the price at the moment of the news".
+    -- NULL means not yet attributed (the window has not closed, or no intraday
+    -- bars covered it) — deliberately distinct from an attributed 0.0.
+    move_from_ts     TEXT,
+    move_to_ts       TEXT,
+    move_percent     DOUBLE PRECISION,
+    move_volume_x    DOUBLE PRECISION  -- window's volume vs a median 5m bar
 );
 
 -- How much each news source actually returned, per day.
@@ -298,6 +308,14 @@ ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_time TEXT;
 -- well it reads are different axes, and averaging them destroys both.
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions      INT;
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions_prev INT;
+
+-- Did the stock actually move on this? Four columns rather than one because
+-- a bare percentage would be unreadable without the window it was measured
+-- over, and the window is the honest part of the claim.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_from_ts  TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_to_ts    TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_percent  DOUBLE PRECISION;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_volume_x DOUBLE PRECISION;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for
