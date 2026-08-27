@@ -337,7 +337,10 @@ def parse_full_text(payload: str, company_name: str,
             continue                    # our own filing, already in the feed
 
         filer = _filer_name(source)
-        form = str(source.get("file_type") or source.get("root_form") or "").strip()
+        # `form` is the parent filing, `file_type` the individual document. A
+        # hit inside an exhibit reports file_type "EX-99.1", which reads as
+        # nonsense in a headline — the thing that was filed is the 8-K.
+        form = str(source.get("form") or source.get("file_type") or "").strip()
         url = _fulltext_url(hit.get("_id"), ciks)
         if not filer or not form or not url:
             continue

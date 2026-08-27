@@ -565,15 +565,20 @@ class TestInsiderCounters:
         assert body["results"][0]["filings"] == 4
 
 
-def fulltext_payload(hits):
-    """`hits` is [(filer_display, cik, form)]."""
+def fulltext_payload(hits, file_type=None):
+    """`hits` is [(filer_display, cik, form)].
+
+    `file_type` overrides the per-document type, which is how efts reports a
+    hit that landed inside an exhibit rather than the filing body.
+    """
     return json.dumps({"hits": {"hits": [
         {
             "_id": f"0000{cik}-26-00000{i}:doc.htm",
             "_source": {
                 "display_names": [f"{filer}  (XYZ)  (CIK 000000{cik})"],
                 "ciks": [str(cik)],
-                "file_type": form,
+                "form": form,
+                "file_type": file_type or form,
                 "file_date": "2026-08-25",
             },
         }
@@ -617,6 +622,17 @@ class TestEdgarFullText:
             fulltext_payload([("Apple Inc", 320193, "10-K")]),
             "Apple Inc.", own_cik=None)
         assert len(articles) == 1
+
+    def test_a_hit_inside_an_exhibit_names_the_parent_filing(self):
+        """efts reports the individual document — "EX-99.1" — where the thing
+        that was actually filed is the 8-K. The exhibit type reads as nonsense
+        in a headline."""
+        articles = sec_edgar.parse_full_text(
+            fulltext_payload([("Beta Motors Inc", 999888, "8-K")],
+                             file_type="EX-99.1"),
+            "Rocket Lab", own_cik=None)
+
+        assert articles[0]["title"] == "Beta Motors Inc names Rocket Lab in its 8-K"
 
     def test_the_filer_name_is_stripped_of_its_bracketed_tail(self):
         articles = sec_edgar.parse_full_text(
