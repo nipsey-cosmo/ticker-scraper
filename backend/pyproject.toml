@@ -45,6 +45,12 @@ finbert = [
     "torch (>=2.11.0,<3.0.0)",
     "accelerate (>=1.13.0,<2.0.0)",
 ]
+# The semantic dedup pass (services/embeddings.py). Opt-in for the same reason
+# FinBERT is: it pulls torch. Without it the two lexical dedup passes carry on
+# unchanged and the third simply does not run.
+semantic = [
+    "sentence-transformers (>=5.1.2,<6.0.0)",
+]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

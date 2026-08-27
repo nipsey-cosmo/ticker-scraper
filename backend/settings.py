@@ -105,6 +105,24 @@ BODY_FETCH_LIMIT = _int("STOCKY_BODY_FETCH_LIMIT", 8)          # per refresh
 # "finbert" → ProsusAI/finbert, needs `--extras finbert`, much heavier
 SENTIMENT_BACKEND = os.getenv("STOCKY_SENTIMENT", "vader").strip().lower()
 
+# ── Semantic dedup ───────────────────────────────────────────────────────
+# The third dedup pass catches rewrites that share a story but not a
+# vocabulary ("Nvidia beats on Q3 revenue" / "Chipmaker tops estimates"). It
+# needs a sentence-embedding model, which is an opt-in extra for the same
+# reason FinBERT is — `poetry install --extras semantic`.
+#
+# Empty is the off switch as well as the default: unset means no model, and
+# the two lexical passes carry on exactly as before. A good small default once
+# the extra is installed is "sentence-transformers/all-MiniLM-L6-v2".
+EMBED_MODEL = os.getenv("STOCKY_EMBED_MODEL", "").strip()
+
+# Cosine above which two cluster winners are the same story. Deliberately high.
+# The original build died of over-broad matching, and a semantic test is much
+# easier to make over-broad than a lexical one: at 0.7 two unrelated earnings
+# stories about the same company look alike, because they *are* alike in every
+# way except the fact they report.
+EMBED_SIMILARITY = _float("STOCKY_EMBED_SIMILARITY", 0.82)
+
 # SEC's fair-access policy requires every caller to identify itself with a
 # contact address, and it is enforced, not advisory: a User-Agent carrying a
 # repo URL instead of an email gets a flat 403 while the same request with an

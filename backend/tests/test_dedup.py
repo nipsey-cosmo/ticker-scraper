@@ -323,3 +323,224 @@ class TestPrepareAgainstStorage:
             existing=[self._stored(has_image=1, has_description=1)],
         )
         assert result.enrichments == {}
+
+
+# ── The semantic third pass (3.2) ────────────────────────────────────────
+
+class TestSemanticDedup:
+    """`token_set_ratio` cannot match "Nvidia beats on Q3 revenue" to
+    "Chipmaker tops estimates, shares jump 6%" — same story, near-zero token
+    overlap, and no threshold fixes that because the overlap is not there.
+
+    The real model is an opt-in extra, so these tests inject a stub embedder.
+    That is the honest seam: what needs proving is the *pass* — that it merges
+    a rewrite, refuses two genuinely different stories, keeps its window, and
+    leaves the two lexical passes alone. Which model produces the vectors is a
+    config swap, not behaviour.
+    """
+
+    # Hand-placed unit vectors. Two axes is enough: "same story" is a small
+    # angle, "different story about the same company" is a wide one.
+    VECTORS = {
+        "earnings-beat": [1.0, 0.0],
+        "earnings-beat-rewrite": [0.985, 0.174],      # 10° — cos 0.985
+        "unrelated": [0.0, 1.0],                      # 90° — cos 0.0
+        "same-topic-different-story": [0.766, 0.643],  # 40° — cos 0.766
+    }
+
+    @staticmethod
+    def _stub(monkeypatch, mapping):
+        """Embed by looking the title up in `mapping`; unknown titles are
+        orthogonal to everything, so they can never merge by accident."""
+        from services import dedup, embeddings
+
+        monkeypatch.setattr(dedup.embeddings, "available", lambda: True)
+        monkeypatch.setattr(
+            dedup.embeddings, "embed",
+            lambda texts: [mapping.get(_key(t, mapping), [0.0, 0.0]) for t in texts],
+        )
+        return embeddings
+
+    def _prepare(self, monkeypatch, articles, mapping, existing=None):
+        self._stub(monkeypatch, mapping)
+        return dedup.prepare(articles, "NVDA", "NVIDIA Corporation",
+                             existing=existing)
+
+    def test_a_rewrite_sharing_no_vocabulary_is_merged(self, monkeypatch):
+        """The case the whole pass exists for."""
+        mapping = {
+            "Nvidia beats on Q3 revenue": self.VECTORS["earnings-beat"],
+            "Chipmaker NVDA tops estimates, shares jump 6%":
+                self.VECTORS["earnings-beat-rewrite"],
+        }
+        result = self._prepare(monkeypatch, [
+            article(title="Nvidia beats on Q3 revenue",
+                    url="https://reuters.com/a"),
+            article(title="Chipmaker NVDA tops estimates, shares jump 6%",
+                    url="https://cnbc.com/b", source_domain="cnbc.com"),
+        ], mapping)
+
+        assert len(result.rows) == 1
+        assert result.dropped.get("semantic_duplicate") == 1
+        # The better source won, as it does in every other pass.
+        assert result.rows[0]["source_domain"] == "reuters.com"
+
+    def test_two_different_stories_about_one_stock_are_both_kept(self, monkeypatch):
+        """The failure mode that killed the original build. Two Nvidia stories
+        on one day are *alike* in every way except the fact they report, which
+        is precisely what a semantic test is prone to over-merge."""
+        mapping = {
+            "Nvidia beats on Q3 revenue": self.VECTORS["earnings-beat"],
+            "Nvidia names new NVDA chief financial officer":
+                self.VECTORS["same-topic-different-story"],
+        }
+        result = self._prepare(monkeypatch, [
+            article(title="Nvidia beats on Q3 revenue", url="https://reuters.com/a"),
+            article(title="Nvidia names new NVDA chief financial officer",
+                    url="https://reuters.com/b"),
+        ], mapping)
+
+        assert len(result.rows) == 2
+        assert "semantic_duplicate" not in result.dropped
+
+    def test_a_rewrite_of_something_already_stored_enriches_it(self, monkeypatch):
+        """Merging against storage is what catches the rewrite that lands a day
+        after the original, which is when rewrites actually land."""
+        from normalize import now_utc, to_iso
+
+        mapping = {
+            "Nvidia beats on Q3 revenue": self.VECTORS["earnings-beat"],
+            "Chipmaker NVDA tops estimates, shares jump 6%":
+                self.VECTORS["earnings-beat-rewrite"],
+        }
+        stored = [{
+            "id": 7, "url_hash": "stored", "title": "Nvidia beats on Q3 revenue",
+            "title_key": "nvidia-beats-q3", "publish_time": to_iso(now_utc()),
+            "source_domain": "reuters.com",
+            "has_description": False, "has_image": False,
+        }]
+        result = self._prepare(monkeypatch, [
+            article(title="Chipmaker NVDA tops estimates, shares jump 6%",
+                    url="https://cnbc.com/b", source_domain="cnbc.com",
+                    image="https://cnbc.com/x.jpg", description="NVDA beat."),
+        ], mapping, existing=stored)
+
+        assert result.rows == []
+        assert result.dropped.get("semantic_duplicate") == 1
+        assert result.enrichments[7]["image"] == "https://cnbc.com/x.jpg"
+
+    def test_the_72_hour_window_still_bounds_it(self, monkeypatch):
+        """Scope is unchanged by design: one stock, ±72 hours. Two identical
+        vectors four days apart are a company that beat twice, not one story."""
+        from datetime import timedelta
+
+        from normalize import now_utc
+
+        mapping = {
+            "Nvidia beats on Q3 revenue": self.VECTORS["earnings-beat"],
+            "Chipmaker NVDA tops estimates, shares jump 6%":
+                self.VECTORS["earnings-beat-rewrite"],
+        }
+        result = self._prepare(monkeypatch, [
+            article(title="Nvidia beats on Q3 revenue", url="https://reuters.com/a"),
+            article(title="Chipmaker NVDA tops estimates, shares jump 6%",
+                    url="https://cnbc.com/b", source_domain="cnbc.com",
+                    published_at=now_utc() - timedelta(days=4)),
+        ], mapping)
+
+        assert len(result.rows) == 2
+
+    def test_no_model_leaves_the_lexical_passes_untouched(self, monkeypatch):
+        """The default. Both existing passes are cheap and catch the bulk, so
+        the third pass being off must cost nothing but the tail."""
+        from services import dedup as dedup_module
+
+        monkeypatch.setattr(dedup_module.embeddings, "available", lambda: False)
+        monkeypatch.setattr(dedup_module.embeddings, "embed", lambda texts: 1 / 0)
+
+        result = dedup.prepare([
+            article(title="Nvidia beats on Q3 revenue", url="https://reuters.com/a"),
+            article(title="Chipmaker NVDA tops estimates, shares jump 6%",
+                    url="https://cnbc.com/b", source_domain="cnbc.com"),
+        ], "NVDA", "NVIDIA Corporation")
+
+        assert len(result.rows) == 2
+
+    def test_an_embedder_that_returns_nothing_is_survived(self, monkeypatch):
+        """A model that fails mid-refresh must cost the tail, not the batch."""
+        from services import dedup as dedup_module
+
+        monkeypatch.setattr(dedup_module.embeddings, "available", lambda: True)
+        monkeypatch.setattr(dedup_module.embeddings, "embed", lambda texts: None)
+
+        result = dedup.prepare([
+            article(title="Nvidia beats on Q3 revenue", url="https://reuters.com/a"),
+        ], "NVDA", "NVIDIA Corporation")
+
+        assert len(result.rows) == 1
+
+    def test_it_only_ever_embeds_winners(self, monkeypatch):
+        """Winners only is the cost control: a few dozen titles per stock, not
+        every article scraped."""
+        from services import dedup as dedup_module
+
+        batches = []
+        monkeypatch.setattr(dedup_module.embeddings, "available", lambda: True)
+
+        def counting(texts):
+            batches.append(len(texts))
+            return [[1.0, 0.0]] * len(texts)
+
+        monkeypatch.setattr(dedup_module.embeddings, "embed", counting)
+
+        # Three copies of one story plus one churn headline. Only the surviving
+        # winner should ever reach the embedder.
+        same = "Nvidia beats on Q3 revenue as data centre sales climb"
+        dedup.prepare([
+            article(title=same, url="https://reuters.com/a"),
+            article(title=same, url="https://ap.com/b", source_domain="ap.org"),
+            article(title=same, url="https://cnbc.com/c", source_domain="cnbc.com"),
+            article(title="Should You Buy NVDA Stock Right Now?",
+                    url="https://fool.com/d", source_domain="fool.com"),
+        ], "NVDA", "NVIDIA Corporation")
+
+        assert batches == [1]
+
+
+class TestEmbeddingsModule:
+    def test_no_configured_model_means_unavailable(self, monkeypatch):
+        from services import embeddings
+
+        monkeypatch.setattr(embeddings.settings, "EMBED_MODEL", "")
+        embeddings.reset()
+        assert embeddings.available() is False
+        assert embeddings.embed(["anything"]) is None
+
+    def test_a_missing_package_latches_rather_than_retrying(self, monkeypatch, capsys):
+        """A missing extra must not print a traceback per stock per hour."""
+        from services import embeddings
+
+        monkeypatch.setattr(embeddings.settings, "EMBED_MODEL", "not/a-real-model")
+        embeddings.reset()
+
+        assert embeddings.embed(["a"]) is None
+        first = capsys.readouterr().out
+        assert embeddings.embed(["b"]) is None
+        assert capsys.readouterr().out == ""      # latched, said nothing twice
+        assert "unavailable" in first
+        embeddings.reset()
+
+    def test_cosine_of_identical_vectors_is_one(self):
+        from services import embeddings
+
+        assert embeddings.cosine([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+        assert embeddings.cosine([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+        assert embeddings.cosine([], [1.0]) == 0.0
+
+
+def _key(text: str, mapping: dict) -> str:
+    """The stub embeds `title. description`; match on the title half."""
+    for known in mapping:
+        if text.startswith(known):
+            return known
+    return text

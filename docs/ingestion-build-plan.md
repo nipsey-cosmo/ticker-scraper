@@ -581,7 +581,7 @@ and daily rows on the long one.
 
 ### 3.2 — D2 · Embedding dedup for the semantic tail
 
-- [ ] `feat: catch rewrites that share a story but not a vocabulary`
+- [x] `feat: catch rewrites that share a story but not a vocabulary`
 
 **Files** `backend/services/dedup.py`, `backend/db/connection.py`,
 `pyproject.toml`, `backend/tests/test_dedup.py`
