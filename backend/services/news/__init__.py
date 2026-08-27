@@ -5,6 +5,7 @@ or rate limit can take the feed down:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
     EDGAR search  filings by *other* companies that name this one (US, opt-in)
+    RNS           UK regulatory announcements — EDGAR's opposite number (non-US)
     Newswires     the company's own release, which every article rewrites
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
@@ -41,7 +42,7 @@ from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
 from . import (bing_news, extract, finviz, google_news, images, nasdaq_news,
-               sec_edgar, wires, yahoo_news)
+               rns, sec_edgar, wires, yahoo_news)
 
 __all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
            "FAST_SOURCES"]
@@ -107,7 +108,14 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
                                                       days=days)))
         else:
             skipped.update({sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
+        skipped.add(rns.SOURCE_TYPE)
     else:
+        # RNS is EDGAR's opposite number, so it is gated the same way and on
+        # the same test — inverted. A New York listing files with the SEC, not
+        # the LSE, and asking for its RNS announcements is asking for nothing.
+        tasks.append((rns.SOURCE_TYPE,
+                      lambda: rns.for_stock(short_name, company_name,
+                                            _alias_tuple(yahoo_symbol))))
         skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
                         sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
 

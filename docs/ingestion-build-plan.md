@@ -683,7 +683,7 @@ naming another filer is attributed to the right stock.
 
 ### 3.6 — B3 · RNS and non-US filings
 
-- [ ] `feat: read UK regulatory announcements`
+- [x] `feat: read UK regulatory announcements`
 
 **Files** `backend/services/news/rns.py` (new),
 `backend/services/news/__init__.py`, `backend/tests/test_news_parsers.py`
