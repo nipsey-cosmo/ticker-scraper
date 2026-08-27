@@ -402,6 +402,13 @@ def in_session(chart: dict) -> list[dict]:
     an event look like it moved the stock 3%, so it is dropped rather than
     stored and reasoned about later.
 
+    Compared as a **time of day**, not as an absolute window, and that is not a
+    simplification — it is the bug fix. `currentTradingPeriod` is the current
+    *or next* session: ask before the opening bell and it names today's session
+    while `range=1d` hands back yesterday's bars. Matching absolute timestamps
+    then drops a whole day of them. The bell rings at the same clock time
+    either way, so the hours are what to compare.
+
     A payload that does not state its session is stored whole — the feed's own
     filter is then the only one we have, and dropping everything would be worse
     than trusting it.
@@ -410,8 +417,20 @@ def in_session(chart: dict) -> list[dict]:
     session = chart.get("session")
     if not session:
         return points
-    return [bar for bar in points
-            if session["start"] <= bar["ts"] <= session["end"]]
+
+    # "HH:MM:SS" out of an ISO stamp. Fixed width, so string order is clock
+    # order and no parsing is needed.
+    start, end = session["start"][11:19], session["end"][11:19]
+
+    def in_hours(stamp: str) -> bool:
+        clock = stamp[11:19]
+        if start <= end:
+            return start <= clock <= end
+        # Sydney and Tokyo open before midnight UTC and close after it, so the
+        # window wraps rather than being empty.
+        return clock >= start or clock <= end
+
+    return [bar for bar in points if in_hours(bar["ts"])]
 
 
 def refresh_intraday(short_name: str) -> int:

@@ -697,6 +697,37 @@ class TestSessionFilter:
         stored = db.prices.get_history("AAPL", "2026-01-01", interval="5m")
         assert [b["close"] for b in stored] == [100.0, 101.0, 102.0]
 
+    def test_yesterdays_bars_survive_todays_session_window(self, stocked_db, monkeypatch):
+        """The bug the live smoke caught. `currentTradingPeriod` is the current
+        *or next* session: asked before the opening bell it names today, while
+        `range=1d` hands back yesterday's bars. Comparing absolute timestamps
+        dropped all 79 of them. The bell rings at the same clock time either
+        way, so the hours are what gets compared."""
+        import db
+
+        # Bars from the 26th; the payload's session block names the 27th.
+        yesterday = [SESSION_OPEN - 86400 + i * 300 for i in range(3)]
+        payload = intraday_payload(yesterday, [100.0, 101.0, 102.0])
+        monkeypatch.setattr(yahoo, "_try_hosts", lambda *a, **kw: payload)
+
+        assert prices.refresh_intraday("AAPL") == 3
+
+        stored = db.prices.get_history("AAPL", "2026-01-01", interval="5m")
+        assert [b["ts"][:10] for b in stored] == ["2026-08-26"] * 3
+
+    def test_a_session_that_crosses_midnight_utc_still_bounds(self):
+        """Sydney and Tokyo open before midnight UTC and close after it, so the
+        window wraps rather than being empty."""
+        chart = {
+            "session": {"start": "2026-08-26T23:00:00Z", "end": "2026-08-27T06:00:00Z"},
+            "points": [
+                {"ts": "2026-08-26T23:30:00Z", "close": 1.0},   # in
+                {"ts": "2026-08-27T05:30:00Z", "close": 2.0},   # in
+                {"ts": "2026-08-27T12:00:00Z", "close": 3.0},   # out
+            ],
+        }
+        assert [b["close"] for b in prices.in_session(chart)] == [1.0, 2.0]
+
     def test_a_payload_with_no_session_window_is_stored_whole(self):
         """Yahoo's own filter is then the only one there is, and trusting it
         beats discarding a day of bars."""
