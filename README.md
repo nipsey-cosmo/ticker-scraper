@@ -9,7 +9,11 @@ coverage, and ranks what survives by how far the price moved today. It runs on
 your own machine against your own Postgres. No account, no subscription tier, no
 API key required.
 
-FastAPI, Postgres and React. MIT licensed.
+**It is an API first.** The FastAPI backend scrapes, stores and serves
+everything on its own, so you can run it alone and read it from a script, a
+notebook or your own client. The React frontend is an optional client for it.
+
+FastAPI and Postgres, with an optional React UI. MIT licensed.
 
 ## Why it is worth running
 
@@ -41,7 +45,9 @@ to the sources being scraped.
 
 ## Quick start
 
-You need Python 3.12, Node, and Postgres 18 or newer. The version floor is real:
+### The API
+
+You need Python 3.12 and Postgres 18 or newer. The version floor is real:
 surrogate keys default to the built-in `uuidv7()`, which arrived in 18 and has no
 extension fallback. `docker compose up` in `backend/` brings its own.
 
@@ -55,24 +61,42 @@ poetry install
 python main.py                  # API on :5000, docs at /docs
 ```
 
+That is a complete install. Follow a stock, then read its news and prices with
+any HTTP client:
+
 ```bash
-cd frontend
-npm install
-npm run dev                     # UI on :3000
+curl -X POST http://127.0.0.1:5000/watchlist \
+     -H "Content-Type: application/json" -d '{"symbol": "AAPL"}'
+curl "http://127.0.0.1:5000/news?symbols=AAPL&days=7"
+curl "http://127.0.0.1:5000/stocks/AAPL/prices?days=30"
 ```
 
-A third terminal is optional. Without it the UI still works, showing whatever
+`/docs` has the full schema, and the [backend README](backend/README.md#api)
+lists the route groups. There is no authentication, so the API binds to
+loopback by default.
+
+A second terminal is optional. Without it the API still answers, with whatever
 was last scraped until you refresh a stock yourself.
 
 ```bash
 cd backend && python scheduler.py    # background refreshes
 ```
 
+### The frontend (optional)
+
+You need Node.
+
+```bash
+cd frontend
+npm install
+npm run dev                     # UI on :3000
+```
+
 Leave both ports alone. Vite is pinned to 3000, the frontend calls 5000, and the
 backend's CORS allow-list names both. Change one on its own and you get a silent
 CORS failure that looks like an empty dashboard.
 
-## Using it
+## Using the frontend
 
 Add a stock from the watchlist editor in the ticker strip. Following one kicks
 off a month-long backfill of prices and news, so the feed fills in behind you.
