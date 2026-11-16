@@ -275,6 +275,10 @@ $fn$ LANGUAGE plpgsql;
 _ALTERS = """
 ALTER TABLE news   ADD COLUMN IF NOT EXISTS impact TEXT;
 
+-- The article text. Nothing read an article before this: sentiment and the
+-- event prompt both ran on a headline and whatever teaser the feed gave.
+ALTER TABLE news   ADD COLUMN IF NOT EXISTS body   TEXT;
+
 -- Yahoo returns the full bar in the same payload as the close; storing only
 -- `close` meant no candlesticks and, worse, no volume — which is the number
 -- that says whether a headline actually mattered.
@@ -282,6 +286,18 @@ ALTER TABLE prices ADD COLUMN IF NOT EXISTS open   DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS high   DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS low    DOUBLE PRECISION;
 ALTER TABLE prices ADD COLUMN IF NOT EXISTS volume BIGINT;
+
+-- The next earnings date, and which side of the bell it lands on. Two
+-- columns rather than a table: at most one date per stock is ever wanted,
+-- and past ones are filtered on read rather than kept as history.
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_date DATE;
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_time TEXT;
+
+-- Reddit mention counts, now and 24h ago. Deliberately its own pair of
+-- columns and never folded into `sentiment`: how loud a stock is and how
+-- well it reads are different axes, and averaging them destroys both.
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions      INT;
+ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions_prev INT;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for

@@ -302,6 +302,37 @@ def get_missing_images(short_names: list[str], limit: int = 12) -> list[dict]:
         """, [*short_names, limit]))
 
 
+def get_missing_bodies(news_ids: list[UUID], limit: int = 8) -> list[dict]:
+    """Articles from this refresh that have no text yet and might yield some.
+
+    Two domains are excluded rather than tried: a Google `CBMi...` redirect has
+    no article behind it, only a consent page, and an SEC filing is megabytes
+    of XBRL whose useful content is already in the title `sec_edgar` builds.
+    """
+    if not news_ids:
+        return []
+    with get_connection() as conn:
+        return rows(conn.execute("""
+            SELECT id, url FROM news
+            WHERE id = ANY(%s)
+              AND body IS NULL
+              AND source_domain NOT IN ('news.google.com', 'sec.gov', '')
+              AND source_domain IS NOT NULL
+            ORDER BY publish_time DESC, id DESC LIMIT %s
+        """, (list(news_ids), limit)))
+
+
+def set_bodies(bodies: dict[UUID, str]) -> int:
+    if not bodies:
+        return 0
+    with get_connection() as conn:
+        return executemany(
+            conn,
+            "UPDATE news SET body = %s WHERE id = %s AND body IS NULL",
+            [(text, news_id) for news_id, text in bodies.items()],
+        )
+
+
 def count_by_stock(since: str, short_names: list[str] | None = None) -> list[dict]:
     where, params = ["publish_time >= %s"], [since]
     if short_names:

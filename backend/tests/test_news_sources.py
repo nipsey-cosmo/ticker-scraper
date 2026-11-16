@@ -6,6 +6,10 @@ shape fails here instead of quietly returning an empty feed in production.
 """
 from __future__ import annotations
 
+import json
+import threading
+from types import SimpleNamespace
+
 from services.news import bing_news, nasdaq_news, publishers, sec_edgar
 
 # Bing wraps every link in an apiclick redirect that carries the real URL in a
@@ -49,41 +53,33 @@ NASDAQ_RSS = """<?xml version="1.0" encoding="utf-8"?>
 </item>
 </channel></rss>"""
 
-# Real EDGAR shape: entry titles are "8-K  - Current report" with no company
-# anywhere, and routine insider forms (4, 144) outnumber everything else.
-SEC_ATOM = """<?xml version="1.0" encoding="ISO-8859-1" ?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <title>Apple Inc.  (0000320193)</title>
-  <entry>
-    <title>8-K  - Current report</title>
-    <filing-type>8-K</filing-type>
-    <form-name>Current report</form-name>
-    <filing-date>2026-07-30</filing-date>
-    <filing-href>https://www.sec.gov/Archives/edgar/data/320193/000032019326000081-index.htm</filing-href>
-  </entry>
-  <entry>
-    <title>4  - Statement of changes in beneficial ownership</title>
-    <filing-type>4</filing-type>
-    <form-name>Statement of changes in beneficial ownership of securities</form-name>
-    <filing-date>2026-07-28</filing-date>
-    <filing-href>https://www.sec.gov/Archives/edgar/data/320193/000032019326000079-index.htm</filing-href>
-  </entry>
-  <entry>
-    <title>144  - Notice of proposed sale</title>
-    <filing-type>144</filing-type>
-    <form-name>Notice of proposed sale of securities</form-name>
-    <filing-date>2026-07-27</filing-date>
-    <filing-href>https://www.sec.gov/Archives/edgar/data/320193/000032019326000078-index.htm</filing-href>
-  </entry>
-  <entry>
-    <title>10-Q/A  - Quarterly report</title>
-    <filing-type>10-Q/A</filing-type>
-    <form-name>Quarterly report [Sections 13 or 15(d)]</form-name>
-    <filing-date>2026-07-25</filing-date>
-    <filing-href>https://www.sec.gov/Archives/edgar/data/320193/000032019326000077-index.htm</filing-href>
-  </entry>
-</feed>"""
+# Real data.sec.gov shape: `filings.recent` is columnar — parallel lists rather
+# than a list of filings — and routine insider forms (4, 144) outnumber
+# everything else. Nothing in it names the company except the top-level `name`.
+SEC_SUBMISSIONS = json.dumps({
+    "cik": 320193,
+    "name": "Apple Inc.",
+    "tickers": ["AAPL"],
+    "filings": {"recent": {
+        "accessionNumber": ["0000320193-26-000081", "0000320193-26-000079",
+                            "0000320193-26-000078", "0000320193-26-000077"],
+        "filingDate": ["2026-07-30", "2026-07-28", "2026-07-27", "2026-07-25"],
+        "acceptanceDateTime": ["2026-07-30T16:31:02.000Z", "2026-07-28T21:04:11.000Z",
+                               "2026-07-27T18:22:40.000Z", "2026-07-25T20:15:58.000Z"],
+        "form": ["8-K", "4", "144", "10-Q/A"],
+        "items": ["2.02,9.01", "", "", ""],
+        "primaryDocument": ["aapl-20260730.htm", "xslF345X05/wk-form4.xml",
+                            "xslF144X01/primary_doc.xml", "aapl-20260627.htm"],
+        "primaryDocDescription": ["8-K", "FORM 4", "FORM 144",
+                                  "Quarterly report [Sections 13 or 15(d)]"],
+    }},
+})
 
+# The ticker -> CIK map, keyed by row index rather than by symbol.
+SEC_TICKERS = json.dumps({
+    "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+    "1": {"cik_str": 1318605, "ticker": "TSLA", "title": "Tesla, Inc."},
+})
 
 
 class TestBing:
@@ -161,35 +157,54 @@ class TestNasdaq:
 class TestSecEdgar:
     def test_routine_insider_filings_are_dropped(self):
         """Forms 4 and 144 arrive dozens a month and would swamp the feed."""
-        forms = [a["description"] for a in sec_edgar.parse(SEC_ATOM, "Apple Inc.")]
-        assert len(forms) == 2
-        assert not any("beneficial ownership" in f for f in forms)
+        titles = [a["title"] for a in sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")]
+        assert len(titles) == 2
+        assert not any("FORM 4" in t or "FORM 144" in t for t in titles)
 
     def test_amendments_count_as_material(self):
-        titles = [a["title"] for a in sec_edgar.parse(SEC_ATOM, "Apple Inc.")]
+        titles = [a["title"] for a in sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")]
         assert "Apple Inc. filed 10-Q/A: Quarterly report [Sections 13 or 15(d)]" in titles
 
     def test_title_names_the_company_because_the_filed_one_does_not(self):
-        """EDGAR titles are "8-K  - Current report": no company, no ticker. Left
-        as filed, every item would fail the relevance check and every 8-K would
+        """A filing's own description is "8-K": no company, no ticker. Left as
+        filed, every item would fail the relevance check and every 8-K would
         collide on the same dedup key."""
         from services.dedup import is_relevant
-        article = sec_edgar.parse(SEC_ATOM, "Apple Inc.")[0]
-        assert article["title"] == "Apple Inc. filed 8-K: Current report"
+        article = sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")[0]
+        assert article["title"] == "Apple Inc. filed 8-K"
         assert is_relevant(article["title"], "AAPL", "Apple Inc.")
 
-    def test_filing_date_and_link_are_kept(self):
-        article = sec_edgar.parse(SEC_ATOM, "Apple Inc.")[0]
-        assert article["published_at"].date().isoformat() == "2026-07-30"
-        assert article["url"].startswith("https://www.sec.gov/Archives/")
+    def test_a_description_that_only_repeats_the_form_is_dropped(self):
+        """`primaryDocDescription` is usually the form again, which would read
+        as "Apple Inc. filed 8-K: 8-K"."""
+        article = sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")[0]
+        assert article["description"] is None
+
+    def test_acceptance_time_is_kept_not_just_the_filing_date(self):
+        """The whole point of data.sec.gov over the Atom feed: a date alone
+        gives every filing that day the same timestamp, so a two-minute lane
+        cannot tell what has just landed."""
+        article = sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")[0]
+        assert article["published_at"].isoformat().startswith("2026-07-30T16:31:02")
+
+    def test_url_points_at_the_document_under_the_unpadded_cik(self):
+        article = sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc.")[0]
+        assert article["url"] == (
+            "https://www.sec.gov/Archives/edgar/data/320193/"
+            "000032019326000081/aapl-20260730.htm"
+        )
         assert article["source_domain"] == "sec.gov"
 
-    def test_the_filing_outranks_everyone_reporting_on_it(self):
-        from normalize import source_rank
-        assert source_rank("sec.gov") < source_rank("fool.com")
+    def test_an_unparseable_payload_yields_nothing(self):
+        assert sec_edgar.parse("<html><body>Not found.</body></html>", "X") == []
+        assert sec_edgar.parse(json.dumps({"cik": 1}), "X") == []
 
-    def test_unknown_ticker_returns_an_html_page_with_no_entries(self):
-        assert sec_edgar.parse("<html><body>No matching companies.</body></html>", "X") == []
+    def test_short_columns_do_not_raise(self):
+        """The columns are meant to be parallel. If one is not, the filing is
+        dropped rather than taking the whole feed down."""
+        payload = json.dumps({"cik": 320193,
+                              "filings": {"recent": {"form": ["8-K"]}}})
+        assert sec_edgar.parse(payload, "Apple Inc.") == []
 
     def test_is_skipped_entirely_without_a_declared_contact(self, monkeypatch):
         """SEC enforces its fair-access policy with 403s. No contact configured
@@ -209,6 +224,62 @@ class TestSecEdgar:
         assert not sec_edgar.is_material("SC 13G/A")
 
 
+class TestSecCikMap:
+    """Ten thousand rows that only change when a company lists or renames
+    itself. Fetching it per stock would be a megabyte per stock per refresh."""
+
+    @staticmethod
+    def _stub(monkeypatch, urls):
+        monkeypatch.setattr(sec_edgar, "_cik_by_ticker", {})
+        monkeypatch.setattr(sec_edgar, "_cik_lock", threading.Lock())
+
+        def fake_get(url, **kwargs):
+            urls.append(url)
+            body = SEC_TICKERS if "company_tickers" in url else SEC_SUBMISSIONS
+            return SimpleNamespace(status=200, ok=True, text=body,
+                                   json=lambda body=body: json.loads(body))
+
+        monkeypatch.setattr(sec_edgar.scraper, "get", fake_get)
+
+    def test_the_map_is_fetched_once_and_reused(self, monkeypatch):
+        import settings
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        urls = []
+        self._stub(monkeypatch, urls)
+
+        sec_edgar.fetch("AAPL", "Apple Inc.")
+        sec_edgar.fetch("TSLA", "Tesla, Inc.")
+
+        assert sum("company_tickers" in u for u in urls) == 1
+        assert "CIK0001318605.json" in urls[-1]
+
+    def test_cik_is_zero_padded_to_ten_digits_in_the_url(self, monkeypatch):
+        import settings
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        urls = []
+        self._stub(monkeypatch, urls)
+
+        sec_edgar.fetch("AAPL", "Apple Inc.")
+        assert urls[-1] == "https://data.sec.gov/submissions/CIK0000320193.json"
+
+    def test_an_unknown_ticker_makes_no_submissions_request(self, monkeypatch):
+        """A CIK guessed from a ticker would fetch another company's filings."""
+        import settings
+        monkeypatch.setattr(settings, "SEC_CONTACT", "someone@example.com")
+        urls = []
+        self._stub(monkeypatch, urls)
+
+        assert sec_edgar.fetch("SHEL", "Shell plc") == []
+        assert not any("submissions" in u for u in urls)
+
+    def test_sec_hosts_share_one_ceiling(self):
+        """SEC states 10 req/s across all of its hosts combined, so the two
+        cannot each claim it."""
+        from services.http_client import _HOST_RATES
+        combined = _HOST_RATES["www.sec.gov"][1] + _HOST_RATES["data.sec.gov"][1]
+        assert combined <= 10.0
+
+
 class TestCollectionAccounting:
     """`collect` is where per-source attribution still exists — after the merge
     in `refresh` there is no telling which source produced what, and a source
@@ -226,6 +297,7 @@ class TestCollectionAccounting:
             (news_pkg.finviz, ("fetch",)),
             (news_pkg.nasdaq_news, ("fetch",)),
             (news_pkg.sec_edgar, ("fetch",)),
+            (news_pkg.wires, ("for_stock",)),
         ):
             for name in names:
                 monkeypatch.setattr(module, name, lambda *a, **kw: [])
@@ -240,7 +312,7 @@ class TestCollectionAccounting:
 
         rows = {r["source_type"]: r for r in db.sources.yields()}
         assert set(rows) == {"GOOGLE_NEWS", "YAHOO_SEARCH", "YAHOO_RSS",
-                             "BING_NEWS", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
+                             "BING_NEWS", "WIRES", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
         assert all(r["fetches"] == 1 and r["skips"] == 0 for r in rows.values())
 
     def test_a_london_listing_records_the_us_sources_as_skipped(self, temp_db, monkeypatch):
@@ -285,3 +357,75 @@ class TestCollectionAccounting:
 
         bing = {r["source_type"]: r for r in db.sources.yields()}["BING_NEWS"]
         assert bing["fetches"] == 1 and bing["articles"] == 0 and bing["stalled"] is True
+
+
+class TestFastLane:
+    """A filing is public the moment the SEC accepts it, so it gets a
+    two-minute lane. Everything else is somebody's write-up and waits."""
+
+    def test_only_the_lane_s_sources_are_asked(self, temp_db, monkeypatch):
+        import db
+        from services import news as news_pkg
+        TestCollectionAccounting._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+
+        news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS",
+                         only=news_pkg.FAST_SOURCES)
+
+        assert {r["source_type"] for r in db.sources.yields()} == {"SEC_EDGAR", "WIRES"}
+
+    def test_a_source_outside_the_lane_is_not_recorded_as_skipped(self, temp_db, monkeypatch):
+        """Not its turn is not the same as unavailable. Recording it as a skip
+        every two minutes would drown the daily counts the flag reads."""
+        import db
+        from services import news as news_pkg
+        TestCollectionAccounting._quiet(monkeypatch)
+
+        # A London listing: EDGAR is genuinely skipped, the rest are just not
+        # in this lane.
+        news_pkg.collect("SHEL", "Shell plc", "SHEL.L", "LSE",
+                         only=news_pkg.FAST_SOURCES)
+
+        rows = {r["source_type"]: r for r in db.sources.yields()}
+        assert set(rows) == {"SEC_EDGAR", "WIRES"}
+        assert rows["SEC_EDGAR"]["skips"] == 1
+        # The wires are not US-gated: a London listing is exactly what they
+        # cover that Finviz, Nasdaq and EDGAR never will.
+        assert rows["WIRES"]["fetches"] == 1
+
+    def test_the_fast_lane_does_not_run_event_detection(self, stocked_db, monkeypatch):
+        """It is an LLM call per batch. Every two minutes across the watchlist
+        would spend a day of tokens by lunchtime."""
+        import jobs
+        from services import news as news_pkg
+
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+        monkeypatch.setattr(news_pkg.wires, "for_stock", lambda *a, **kw: [])
+        monkeypatch.setattr(
+            news_pkg.sec_edgar, "fetch",
+            lambda *a, **kw: sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc."))
+
+        detected = []
+        monkeypatch.setattr(news_pkg.events, "detect",
+                            lambda *a, **kw: detected.append(a))
+
+        assert jobs.refresh_news_fast()["inserted"] > 0
+        assert detected == []
+
+    def test_the_hourly_lane_still_judges(self, stocked_db, monkeypatch):
+        import jobs
+        from services import news as news_pkg
+
+        TestCollectionAccounting._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+        monkeypatch.setattr(
+            news_pkg.sec_edgar, "fetch",
+            lambda *a, **kw: sec_edgar.parse(SEC_SUBMISSIONS, "Apple Inc."))
+        monkeypatch.setattr(news_pkg.images, "backfill_images", lambda *a, **kw: None)
+
+        detected = []
+        monkeypatch.setattr(news_pkg.events, "detect",
+                            lambda *a, **kw: detected.append(a))
+
+        jobs.refresh_news()
+        assert detected

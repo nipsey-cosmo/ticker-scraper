@@ -65,6 +65,7 @@ def scrape(monkeypatch):
         monkeypatch.setattr(news_service, "collect", lambda *a, **kw: raw)
         monkeypatch.setattr(news_service.sentiment_service, "score_news_ids", lambda *a: None)
         monkeypatch.setattr(news_service.images, "backfill_images", lambda *a: None)
+        monkeypatch.setattr(news_service.extract, "fill_bodies", lambda *a, **kw: 0)
     return install
 
 

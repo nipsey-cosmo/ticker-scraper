@@ -83,5 +83,5 @@ def article_scores(short_name: str, since: str) -> list[dict]:
             SELECT substr(publish_time, 1, 10) AS day, sentiment
             FROM news
             WHERE short_name = %s AND publish_time >= %s AND sentiment IS NOT NULL
-            ORDER BY publish_time
+            ORDER BY publish_time, id
         """, (short_name, since)))

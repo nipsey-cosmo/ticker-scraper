@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from services.news import finviz, google_news, images, publishers, yahoo_news
+from services.news import (extract, finviz, google_news, images, publishers,
+                          wires, yahoo_news)
 
 GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -156,7 +157,7 @@ class TestYahooThumbnails:
         assert yahoo_news._best_thumbnail(thumbnail) is None
 
     def test_html_in_a_summary_is_stripped(self):
-        assert yahoo_news._clean_summary("<p>Apple <b>beat</b> estimates</p>") == \
+        assert yahoo_news.clean_summary("<p>Apple <b>beat</b> estimates</p>") == \
             "Apple beat estimates"
 
 
@@ -208,3 +209,325 @@ class TestImageExtraction:
 
     def test_page_with_no_usable_image(self):
         assert images.extract_image("<html><body><p>text</p></body></html>", "https://x.com") is None
+
+
+# Trimmed from live pulls of all three wires. The Arabic item is the trap:
+# Business Wire's home feed carries every release in up to ten languages, they
+# all name the ticker, and token overlap cannot match Arabic to English.
+WIRE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>Business Wire News</title>
+<item>
+  <title>Rocket Lab Awarded USD 515 Million Space Force Contract</title>
+  <pubDate>Thu, 20 Aug 2026 20:50:00 UT</pubDate>
+  <enclosure url="https://mms.businesswire.com/media/20260820007198/en/neutron.jpg"
+             type="image/jpeg" length="2048"/>
+  <description>LONG BEACH, Calif.--(BUSINESS WIRE)--&lt;p&gt;Rocket Lab (NASDAQ: RKLB)
+    today announced it has been awarded a contract.&lt;/p&gt;</description>
+  <link>http://www.businesswire.com/news/home/20260820007198/en/Rocket-Lab-Awarded</link>
+</item>
+<item>
+  <title>Rocket Lab remporte un contrat de 515 millions de dollars</title>
+  <pubDate>Thu, 20 Aug 2026 20:50:00 UT</pubDate>
+  <description>LONG BEACH--(BUSINESS WIRE)--Rocket Lab (NASDAQ: RKLB) a annonce.</description>
+  <link>http://www.businesswire.com/news/home/20260820007198/fr/?feedref=JjAwJuNHiyst</link>
+</item>
+<item>
+  <title>Vitalist Reports First Quarter 2027 Financial Results</title>
+  <pubDate>Thu, 20 Aug 2026 21:05 GMT</pubDate>
+  <description><![CDATA[Vitalist Reports First Quarter 2027 Financial Results]]></description>
+  <link>https://www.globenewswire.com/news-release/2026/08/20/3348846/0/en/vitalist-q1.html</link>
+</item>
+<item>
+  <title></title>
+  <link>https://www.prnewswire.com/news-releases/untitled-302345.html</link>
+</item>
+</channel></rss>"""
+
+
+class TestWireParse:
+    def test_translations_are_dropped(self):
+        """Half of Business Wire's home feed is the same releases in other
+        languages. They name the ticker so relevance keeps them, and dedup
+        compares token overlap, which cannot match French to English."""
+        titles = [a["title"] for a in wires.parse(WIRE_RSS, "Business Wire")]
+        assert "Rocket Lab Awarded USD 515 Million Space Force Contract" in titles
+        assert not any("remporte" in t for t in titles)
+
+    def test_a_feed_with_no_language_segment_is_not_treated_as_a_translation(self):
+        """PR Newswire URLs carry no language at all, which is not the same as
+        carrying a foreign one."""
+        assert wires._is_english(
+            "https://www.prnewswire.com/news-releases/some-slug-302345.html")
+
+    def test_untitled_items_are_skipped(self):
+        assert len(wires.parse(WIRE_RSS, "PR Newswire")) == 2
+
+    def test_the_release_image_is_taken_from_the_enclosure(self):
+        """Already in hand, and it saves the Open Graph fetch images.py would
+        otherwise make for this article."""
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert article["image"] == \
+            "https://mms.businesswire.com/media/20260820007198/en/neutron.jpg"
+
+    def test_html_is_stripped_from_the_release_body(self):
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert "<p>" not in article["description"]
+        assert "NASDAQ: RKLB" in article["description"]
+
+    def test_domain_and_date_survive(self):
+        article = wires.parse(WIRE_RSS, "Business Wire")[0]
+        assert article["source_domain"] == "businesswire.com"
+        assert article["published_at"].date().isoformat() == "2026-08-20"
+        assert article["source_type"] == "WIRES"
+
+    def test_the_release_outranks_the_write_up_of_it(self):
+        """A rewrite should never win a dedup tie-break against the company's
+        own words."""
+        from normalize import source_rank
+        assert source_rank("businesswire.com") < source_rank("fool.com")
+        assert source_rank("globenewswire.com") < source_rank("benzinga.com")
+
+    def test_an_unnamed_wire_item_is_never_sector_context(self):
+        """Finviz's per-ticker table earns `related`; a firehose does not. An
+        unnamed wire item is simply another company's announcement."""
+        from services.dedup import _RELATED_ALLOWED
+        assert wires.SOURCE_TYPE not in _RELATED_ALLOWED
+
+
+class TestWireFanOut:
+    """The feeds are not per-ticker: one pull covers the whole watchlist."""
+
+    @staticmethod
+    def _stub(monkeypatch, calls):
+        from types import SimpleNamespace
+        wires.reset_cache()
+        monkeypatch.setattr(wires, "_cache", None, raising=False)
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return SimpleNamespace(status=200, ok=True, text=WIRE_RSS)
+
+        monkeypatch.setattr(wires.scraper, "get", fake_get)
+
+    def test_one_pull_serves_every_stock(self, monkeypatch):
+        calls = []
+        self._stub(monkeypatch, calls)
+
+        for short_name in ("RKLB", "AAPL", "TSLA", "SHEL", "VITA"):
+            wires.for_stock(short_name, short_name)
+
+        assert len(calls) == len(wires._FEEDS)
+        wires.reset_cache()
+
+    def test_an_item_naming_the_company_is_kept_and_the_rest_dropped(self, monkeypatch):
+        calls = []
+        self._stub(monkeypatch, calls)
+
+        kept = wires.for_stock("6RJ0", "Rocket Lab Corp", aliases=("RKLB",))
+        assert [a["title"] for a in kept] == [
+            "Rocket Lab Awarded USD 515 Million Space Force Contract"] * len(wires._FEEDS)
+
+        assert wires.for_stock("AAPL", "Apple Inc.") == []
+        wires.reset_cache()
+
+    def test_a_failing_feed_does_not_take_the_others_down(self, monkeypatch):
+        from types import SimpleNamespace
+        wires.reset_cache()
+        seen = []
+
+        def fake_get(url, **kwargs):
+            seen.append(url)
+            if "globenewswire" in url:
+                return None
+            return SimpleNamespace(status=200, ok=True, text=WIRE_RSS)
+
+        monkeypatch.setattr(wires.scraper, "get", fake_get)
+        assert len(wires.fetch()) == 2 * (len(wires._FEEDS) - 1)
+        assert len(seen) == len(wires._FEEDS)
+        wires.reset_cache()
+
+    def test_wires_ride_the_fast_lane(self):
+        """They carry the announcement itself, so waiting an hour for it
+        defeats the point."""
+        from services import news as news_pkg
+        assert wires.SOURCE_TYPE in news_pkg.FAST_SOURCES
+
+
+ARTICLE_HTML = """<html><head><title>Rocket Lab wins contract</title></head><body>
+<nav><a href="/">Home</a><a href="/markets">Markets</a></nav>
+<article><h1>Rocket Lab wins USD 515 million Space Force contract</h1>
+<p>Rocket Lab said on Thursday it had been awarded a contract worth up to 515
+million dollars by the United States Space Force, the largest single award in
+the company history and one that management said would underpin revenue growth
+into 2028.</p>
+<p>The company will supply Neutron launch services under the agreement, with the
+first mission scheduled for the second half of next year. Shares rose 9 percent
+in after-hours trading.</p>
+</article>
+<aside><h2>Related</h2><ul><li>Cookie policy</li><li>Sign up for our newsletter</li></ul></aside>
+</body></html>"""
+
+
+class TestBodyExtraction:
+    def test_the_article_survives_and_the_furniture_does_not(self):
+        body = extract.extract_body(ARTICLE_HTML, "https://example.com/a")
+        assert "Space Force" in body and "515" in body
+        assert "Cookie policy" not in body
+        assert "Markets" not in body
+
+    def test_a_consent_wall_is_not_an_article(self):
+        """trafilatura falls back to the raw text of whatever it is given, so a
+        stub page comes back looking like a successful extraction. Scored as
+        sentiment, that is worse than having no body at all."""
+        assert extract.extract_body(
+            "<html><body><p>403 Forbidden</p></body></html>", "https://x.com/a") is None
+        assert extract.extract_body(
+            "<html><body><p>Please enable JavaScript.</p></body></html>",
+            "https://x.com/a") is None
+
+    def test_a_body_is_capped(self):
+        long_page = ("<html><body><article>"
+                     + "<p>Rocket Lab reported record revenue this quarter. </p>" * 400
+                     + "</article></body></html>")
+        assert len(extract.extract_body(long_page, "https://x.com/a")) == extract._MAX_CHARS
+
+    def test_malformed_input_does_not_raise(self):
+        assert extract.extract_body("", "https://x.com/a") is None
+
+
+class TestBodyBackfill:
+    _n = 0
+
+    @classmethod
+    def _stored(cls, **overrides):
+        """One article already in the table, as it would be after `prepare`."""
+        import db
+        cls._n += 1
+        row = {"short_name": "AAPL", "title": "Rocket Lab wins a launch contract",
+               "title_key": f"k{cls._n}", "url": f"https://example.com/s{cls._n}",
+               "url_hash": f"h{cls._n}", "source": "Reuters",
+               "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
+               "publish_time": "2026-08-20T10:00:00Z"}
+        row.update(overrides)
+        row["url_hash"] = row["url"]
+        return db.news.insert_news_many([row])
+
+    def test_a_failed_extraction_leaves_the_row_intact(self, stocked_db, monkeypatch):
+        """Bodies are best-effort, exactly like images: the article is already
+        stored by the time this runs."""
+        import db
+        from types import SimpleNamespace
+
+        ids = self._stored(url="https://example.com/story-1")
+        monkeypatch.setattr(extract.scraper, "get_many", lambda reqs: [
+            SimpleNamespace(status=200, ok=True, url=r["url"],
+                            headers={"content-type": "text/html"},
+                            text="<html><body><p>nope</p></body></html>")
+            for r in reqs])
+
+        assert extract.fill_bodies(ids) == 0
+        row = db.news.get_news_by_id(ids[0])
+        assert row["body"] is None
+        assert row["title"] and row["url"]
+
+    def test_a_google_redirect_is_skipped_without_a_fetch(self, stocked_db, monkeypatch):
+        """There is no article at a CBMi... address, only a consent page."""
+        ids = self._stored(
+            url="https://news.google.com/rss/articles/CBMilAFBVV95cUxOX2JCTHkt?oc=5",
+            source_domain="news.google.com")
+
+        calls = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: calls.append(reqs) or [])
+
+        assert extract.fill_bodies(ids) == 0
+        assert calls == []
+
+    def test_a_filing_is_skipped_without_a_fetch(self, stocked_db, monkeypatch):
+        """A 10-K is megabytes of XBRL and its useful content is the form
+        type, which sec_edgar already put in the title."""
+        ids = self._stored(
+            url="https://www.sec.gov/Archives/edgar/data/320193/0001/aapl.htm",
+            source_domain="sec.gov")
+
+        calls = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: calls.append(reqs) or [])
+
+        assert extract.fill_bodies(ids) == 0
+        assert calls == []
+
+    def test_a_good_page_is_stored_and_read_by_the_scorer(self, stocked_db, monkeypatch):
+        import db
+        from types import SimpleNamespace
+        from services import sentiment_service
+
+        ids = self._stored(url="https://example.com/story-2",
+                           title="Rocket Lab update", description=None)
+        monkeypatch.setattr(extract.scraper, "get_many", lambda reqs: [
+            SimpleNamespace(status=200, ok=True, url=r["url"],
+                            headers={"content-type": "text/html"}, text=ARTICLE_HTML)
+            for r in reqs])
+
+        assert extract.fill_bodies(ids) == 1
+        row = db.news.get_news_by_id(ids[0])
+        assert "Space Force" in row["body"]
+
+        # The whole point: the scorer now reads the article, not the headline.
+        sentiment_service.score_rows([row])
+        assert db.news.get_news_by_id(ids[0])["sentiment"] == \
+            sentiment_service.score_article(row["title"], row["body"])
+
+    def test_the_cap_bounds_one_refresh(self, stocked_db, monkeypatch):
+        from types import SimpleNamespace
+        ids = []
+        for n in range(6):
+            ids += self._stored(url=f"https://example.com/story-cap-{n}")
+
+        seen = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: seen.append(len(reqs)) or [None] * len(reqs))
+
+        extract.fill_bodies(ids, limit=2)
+        assert seen == [2]
+
+    def test_the_flag_turns_it_off(self, stocked_db, monkeypatch):
+        ids = self._stored(url="https://example.com/story-3")
+        monkeypatch.setattr(extract.settings, "EXTRACT_ARTICLE_BODIES", False)
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: pytest.fail("should not fetch"))
+        assert extract.fill_bodies(ids) == 0
+
+
+class TestBodyReachesTheEventPrompt:
+    def test_the_body_is_preferred_over_the_feed_teaser_and_truncated(self):
+        from services import events
+        article = {
+            "publish_time": "2026-08-20T10:00:00+00:00",
+            "source": "Reuters",
+            "title": "Rocket Lab wins contract",
+            "description": "teaser copy",
+            "body": "REAL BODY. " + "x" * 900,
+        }
+        prompt = events._build_prompt("RKLB", [article], [])
+        assert "REAL BODY." in prompt
+        assert "teaser copy" not in prompt
+        assert "x" * 900 not in prompt
+
+    def test_the_teaser_is_still_used_when_there_is_no_body(self):
+        from services import events
+        article = {
+            "publish_time": "2026-08-20T10:00:00+00:00",
+            "source": "Reuters",
+            "title": "Rocket Lab wins contract",
+            "description": "teaser copy",
+            "body": None,
+        }
+        assert "teaser copy" in events._build_prompt("RKLB", [article], [])
+
+    def test_the_batch_shrank_when_bodies_joined_the_prompt(self):
+        """A body costs roughly twice a description, and a 60-article call
+        already took about a minute."""
+        from services import events
+        assert events._BATCH_SIZE <= 40

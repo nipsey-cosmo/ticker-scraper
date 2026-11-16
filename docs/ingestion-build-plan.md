@@ -26,12 +26,28 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 | Part | Branch | Base | Commits | State |
 |---|---|---|---|---|
 | 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
-| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | ready |
-| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | blocked on 2 |
+| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 6 / 6 | **done, green, unmerged** |
+| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | ready |
 
 Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
-`eslint` clean. Live smoke on 5100/3100 passed — all seven news sources
-returned articles, real OHLCV stored, no console errors on `/` or `/graphs`.
+`eslint` clean.
+
+Suite at the end of Part 2: **731 backend passed + 13 skipped** (the live
+suite, opt-in), **128 frontend / 15 files**, `eslint` clean.
+
+Live smoke on 5100/3100 passed. `POST /refresh` over an 11-stock watchlist:
+EDGAR went 5 → **225 filings** with real acceptance times rather than
+midnight; **38 article bodies** extracted; NVDA earnings **2026-08-26 post**;
+**5 of 11** stocks matched the mention table, including `6RJ0` → `RKLB`
+through the alias path. The wire firehose answered with 63 items across all
+three wires (Business Wire 39 → 23 after the language filter) and matched no
+watchlist company in that window — recorded as `WIRES fetches=11 articles=0`,
+which is the honest answer for a 63-item snapshot, not a dead source. No
+console errors on `/` or `/graphs`.
+
+**Carried into Part 3:** 3.4 is no longer speculative — two hosts are
+actively refusing (stooq.com, accessnewswire.com). The evidence is written
+into that sub-point.
 
 ---
 
@@ -231,7 +247,28 @@ polite.
 
 ### 2.1 — B1 + A3 · EDGAR on data.sec.gov, and a fast lane
 
-- [ ] `feat: real-time filings from data.sec.gov on a two-minute lane`
+- [x] `feat: real-time filings from data.sec.gov on a two-minute lane`
+
+**Done.** The lane is a filter, not a second pipeline: `collect(only=...)`
+drops the tasks outside the lane and `refresh`/`refresh_watchlist` thread it
+through, so the fast lane is the same scrape-dedupe-store path with a smaller
+source list. A source outside the lane is **not** recorded as skipped - only a
+source that was genuinely unavailable is, or 1.5's `stalled` flag would drown
+in thirty skips every two minutes.
+
+`published_at` now comes from `acceptanceDateTime`, not `filingDate`. A date
+alone gives every filing that day the same timestamp, which makes a
+two-minute lane pointless - that, not the ten-minute lag, was the real reason
+the Atom feed could not be polled fast.
+
+`primaryDocDescription` is usually the form again (`"8-K"`), which would have
+titled as "Apple Inc. filed 8-K: 8-K", so it is dropped when it only repeats
+the form. Both SEC hosts were cut to a ceiling of 4.0 each: the stated 10 req/s
+is across `sec.gov` **and** `data.sec.gov` combined, and `www.sec.gov` alone
+was already at 8.0.
+
+Fast-lane logging is gated - a per-stock "found nothing" line every two
+minutes buries the hourly lane's output in a live run.
 
 **Files** `backend/services/news/sec_edgar.py`, `backend/scheduler.py`,
 `backend/jobs.py`, `backend/settings.py`, `backend/tests/test_news_sources.py`
@@ -260,7 +297,36 @@ call event detection.
 
 ### 2.2 — B2 · Newswire ingestion
 
-- [ ] `feat: read the newswires, where company announcements land first`
+- [x] `feat: read the newswires, where company announcements land first`
+
+**Done, three feeds not four.** ACCESS Newswire's RSS returns a flat 403 to
+both curl and the app's scraper - a WAF at the handshake, which is exactly
+what **3.4** exists to fix. Add it there; it is the smallest of the four.
+GlobeNewswire 403s a plain curl but answers the scraper's rotated fingerprint
+fine, so it stayed.
+
+**Half of Business Wire's home feed is translations.** A live pull was 19
+English items of 39; the rest were the same releases in Arabic, Japanese,
+French and six other languages. They carry the ticker so relevance keeps them,
+and dedup compares token overlap, which cannot match Arabic to English - a
+holder would have seen one announcement five times. Both wires that translate
+put the language in the URL path, so `_is_english` catches it there. This was
+not in the audit and would have been a visible bug on day one.
+
+The single fetch is a module-level cache on `wires.fetch()` with a TTL of
+`NEWS_FAST_MINUTES`, so a sweep pulls once and the whole watchlist reads it.
+`for_stock` narrows the firehose with `dedup.is_relevant` - the same check
+every other source is held to - rather than passing a few hundred items per
+stock to `prepare`, which would have made 1.5's per-source yield meaningless.
+
+Business Wire attaches the release image as an RSS enclosure, so wire items
+land with an image and skip the Open Graph fetch entirely.
+
+`yahoo_news._clean_summary` is now `clean_summary`: PR Newswire bodies are
+HTML and it already did exactly the right thing.
+
+Two old tests started making live requests the moment a non-US-gated source
+appeared - the 1.4 lesson again. `_quiet` now stubs `wires.for_stock`.
 
 **Files** `backend/services/news/wires.py` (new),
 `backend/services/news/__init__.py`, `backend/tests/test_news_parsers.py`
@@ -286,7 +352,39 @@ kept and one naming nothing is dropped, and that one fetch covers N stocks.
 
 ### 2.3 — D1 · Article body extraction
 
-- [ ] `feat: extract article text so sentiment sees more than a headline`
+- [x] `feat: extract article text so sentiment sees more than a headline`
+
+**Done, and it runs inside `refresh`, not after it.** The plan said "gated
+exactly like `images.py`", but images runs *after* the watchlist loop - which
+would have put the body in the row after scoring and after the event pass had
+already read the headline. `extract.fill_bodies` sits between
+`insert_news_many` and `score_news_ids` instead, so both consumers see it on
+the same cycle.
+
+It is scoped to **this refresh's inserted ids**, not to every body-less row
+for the stock. Widening it to history would have meant `BODY_FETCH_LIMIT` x
+the watchlist every hour forever, for articles scored and judged long ago -
+which is the "hundreds of fetches" the Watch note forbids. A sweep inserts a
+handful per stock, so a cycle costs tens.
+
+`_MIN_CHARS = 200` is load-bearing and was not in the plan: **trafilatura
+falls back to the raw text of whatever it is handed**, so a consent wall, a
+paywall stub or a bare `403 Forbidden` comes back looking like a successful
+extraction - and would then be scored as that article's sentiment.
+`favor_precision=True` for the same reason.
+
+SEC filing pages are skipped alongside Google's `CBMi...` redirects: a 10-K is
+megabytes of XBRL whose useful content is the form type, already in the title
+`sec_edgar` builds.
+
+`_BATCH_SIZE` 60 -> 40 and the blurb cap 200 -> 400 chars, so the event prompt
+and its ~57s wall-clock stay where they were. `body` is not on the
+`NewsArticle` schema, so the API payload is unchanged - it is scorer input,
+not something the UI shows.
+
+Two more test files were silently reaching the live network once a fetch
+appeared inside `refresh` (`test_events`, `test_llm_optional`). That is three
+times now; recorded in marl.
 
 **Files** `backend/services/news/extract.py` (new),
 `backend/services/news/__init__.py`, `backend/db/connection.py`,
@@ -313,7 +411,33 @@ row intact and that a Google-redirect URL is skipped without a fetch.
 
 ### 2.4 — B5 · Earnings calendar
 
-- [ ] `feat: track earnings dates, the one market-moving date you can see coming`
+- [x] `feat: track earnings dates, the one market-moving date you can see coming`
+
+**Done, two columns not a table.** At most one date per stock is ever wanted
+and past ones are filtered on read, so `stocks.next_earnings_date` and
+`next_earnings_time` in `_ALTERS` beat a table plus a db module plus a join.
+
+`set_earnings` **clears every date before writing**, in one transaction.
+Merging would have been wrong: a company that moves its report out of the
+14-day window sends no signal saying the old date is false, so the stale one
+would be served until it passed. Rewriting the whole set is the only version
+that cannot go stale.
+
+The API filters again on read (`_upcoming_earnings`) because the sweep is
+daily and a date falls into the past between runs - at which point "reports
+on Tuesday" is a lie rather than merely old.
+
+The join to Nasdaq's unsuffixed US symbols goes through the resolved
+`yahoo_symbol`, gated on `is_us_listing`, so a London listing is never even
+looked up. Scanned forward day by day, so the first hit is genuinely the
+*next* date.
+
+A day with no earnings answers 200 with `rows: null`. That is most Saturdays,
+and untreated it looks exactly like a broken scraper.
+
+`services/calendar.py` shadows a stdlib module name by file name only -
+absolute imports mean `import calendar` still finds stdlib, and nothing under
+`services/` imports it.
 
 **Files** `backend/services/calendar.py` (new), `backend/db/connection.py`,
 `backend/jobs.py`, `backend/scheduler.py`, `backend/routes/stocks.py`,
@@ -336,7 +460,29 @@ that a stale past date is not served as upcoming.
 
 ### 2.5 — B4 · Retail mention velocity
 
-- [ ] `feat: track retail mention velocity as its own signal`
+- [x] `feat: track retail mention velocity as its own signal`
+
+**Done.** Two columns on `stocks` again (`social_mentions`,
+`social_mentions_prev`), and `set_social` clears before it writes for the same
+reason `set_earnings` does: falling out of the ranked table means the stock
+has gone *quiet*, and keeping the old count would report the exact opposite.
+
+The delta is computed on read, not stored, so there is one source of truth for
+it. The level is served alongside it because 61 mentions up from 44 and 3 up
+from 1 are not the same story.
+
+Matching goes through the resolved `yahoo_symbol` first and the local
+`short_name` second - Trading212 calls Rocket Lab `6RJ0` and Reddit calls it
+`RKLB`, so the plan's `short_name.split(".")[0]` alone would have missed it.
+Only the top hundred are ranked, and a stock outside them genuinely has no
+chatter; that absence is the right answer, not a miss.
+
+**Unrelated pre-existing bug fixed to get green:** `db.graphs.article_scores`
+ordered by `publish_time` with no unique tiebreaker, so three articles sharing
+a timestamp came back in a different order between runs and flipped
+`test_scores_land_in_the_right_bucket`. It reproduces on 2.4's tip with this
+sub-point stashed, so it is not from this work. One line: `ORDER BY
+publish_time, id`, which is the convention `backend/CLAUDE.md` already states.
 
 **Files** `backend/services/social.py` (new), `backend/db/connection.py`,
 `backend/jobs.py`, `backend/routes/stocks.py`, `backend/tests/test_api.py`
@@ -359,7 +505,26 @@ ignored, and the stored delta is the change and not the level.
 
 ### 2.6 — E2 · Live smoke test
 
-- [ ] `test: add an opt-in live smoke test for every source parser`
+- [x] `test: add an opt-in live smoke test for every source parser`
+
+**Done, and it immediately earned its keep.** Thirteen live tests, marked per
+class rather than module-wide so the gate's own test can sit in the same file
+and actually run. `conftest.pytest_collection_modifyitems` skips anything
+marked `live` unless `-m live` names it - not a default `-m` in the config,
+because any `-m` the caller passes would then override it.
+
+`TestTheGate` is unmarked on purpose and includes a guard that every other
+`Test*` class in the file carries the marker: a new class added without it
+would run live in the normal suite, which is the one failure mode that makes
+this whole file a liability.
+
+**Twelve of thirteen sources answer. Stooq does not.** It now serves the CSV
+endpoint a **200 carrying a JavaScript browser-check interstitial**, so 1.4's
+history fallback has been returning `[]` and reading as "no data". The
+fixture tests still pass, which is exactly the blindness this sub-point was
+positioned to catch. `stooq.history` now tells HTML from CSV and says so;
+the live test is `xfail` with the reason. **This is the evidence 3.4 asks
+for** - see the note there.
 
 **Files** `backend/tests/test_live_sources.py` (new),
 `backend/pyproject.toml`, `backend/tests/conftest.py`
@@ -471,10 +636,18 @@ anti-bot databases since 2017 — a host behind Cloudflare Bot Management blocks
 at the handshake, before a header is read. Put `curl_cffi` with
 `impersonate="chrome"` behind a flag.
 
+**Evidence gathered in Part 2 - two hosts are refusing, so build it:**
+- **stooq.com** answers its CSV endpoint with a 200 carrying a JavaScript
+  browser-check page. Found by 2.6's live suite; 1.4's history fallback is
+  dead until this lands. `services/stooq.py` already detects and logs it.
+- **accessnewswire.com** returns a flat 403 to both curl and the scraper's
+  rotated fingerprint, which is why 2.2 shipped three wires instead of four.
+  Adding it is a one-line `_FEEDS` entry once the transport can get through.
+- GlobeNewswire 403s a plain curl but *does* answer the existing scraper, so
+  header rotation is still doing real work - this replaces the transport
+  beneath it, nothing else.
+
 **Watch**
-- **Only build this if a host is actually 403-ing.** If nothing is refusing,
-  tick the box with a one-line note in this file and skip it — premature
-  insurance is just complexity. Check `/health` throttle counters first.
 - Every rate-limit, breaker and cache line stays untouched. This swaps the
   transport, nothing else.
 - It also restores real HTTP/2 without the hpack thread-safety bug that forced

@@ -78,6 +78,9 @@ BACKFILL_DAYS = _int("STOCKY_BACKFILL_DAYS", 30)      # history pulled for a new
 PRICE_REFRESH_OPEN_MINUTES = _int("STOCKY_PRICE_REFRESH_OPEN_MINUTES", 5)
 PRICE_REFRESH_MINUTES = _int("STOCKY_PRICE_REFRESH_MINUTES", 60)
 NEWS_REFRESH_MINUTES = _int("STOCKY_NEWS_REFRESH_MINUTES", 60)
+# The fast lane carries only sources where minutes matter — a filing is
+# public the moment it is accepted, and the write-ups follow it.
+NEWS_FAST_MINUTES = _int("STOCKY_NEWS_FAST_MINUTES", 2)
 QUOTE_STALE_MINUTES = _int("STOCKY_QUOTE_STALE_MINUTES", 15)   # serve cached quote under this age
 NEWS_RETENTION_DAYS = _int("STOCKY_NEWS_RETENTION_DAYS", 120)
 
@@ -91,6 +94,11 @@ FETCH_ARTICLE_IMAGES = _flag("STOCKY_FETCH_ARTICLE_IMAGES", True)
 # fresh database starts empty and fills up as you follow things.
 SEED_ON_START = _flag("STOCKY_SEED_ON_START", True)
 IMAGE_FETCH_LIMIT = _int("STOCKY_IMAGE_FETCH_LIMIT", 12)       # per stock per refresh
+# Body extraction costs the same one request per article as an image does,
+# and is capped the same way. Small on purpose: it runs before scoring, so
+# the limit is what keeps a refresh from turning into hundreds of fetches.
+EXTRACT_ARTICLE_BODIES = _flag("STOCKY_EXTRACT_ARTICLE_BODIES", True)
+BODY_FETCH_LIMIT = _int("STOCKY_BODY_FETCH_LIMIT", 8)          # per refresh
 
 # ── Sentiment ────────────────────────────────────────────────────────────
 # "vader"   → finance-tuned VADER, no torch, instant (default)

@@ -4,6 +4,7 @@ Seven fetches across five independent operators, so no single company's outage
 or rate limit can take the feed down:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
+    Newswires     the company's own release, which every article rewrites
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
     Yahoo RSS     summaries
@@ -38,14 +39,28 @@ import settings
 from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
-from . import bing_news, finviz, google_news, images, nasdaq_news, sec_edgar, yahoo_news
+from . import (bing_news, extract, finviz, google_news, images, nasdaq_news,
+               sec_edgar, wires, yahoo_news)
 
-__all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images"]
+__all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
+           "FAST_SOURCES"]
+
+# The two-minute lane: the two sources that carry the announcement itself
+# rather than somebody's write-up of it. Both are minutes ahead of the rest,
+# and both are cheap — a filing check is one JSON body, and the wires are one
+# shared pull for the whole watchlist.
+FAST_SOURCES = frozenset({sec_edgar.SOURCE_TYPE, wires.SOURCE_TYPE})
 
 
 def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
-            exchange: str | None, days: int = 2) -> list[dict]:
-    """Every source's articles for one stock, unmerged."""
+            exchange: str | None, days: int = 2,
+            only: frozenset[str] | None = None) -> list[dict]:
+    """Every source's articles for one stock, unmerged.
+
+    `only` restricts the fan-out to one lane's sources. A source outside the
+    lane is neither fetched nor recorded as skipped — it was not asked because
+    this is not its turn, which is not the same as being unavailable.
+    """
     ticker = yahoo_symbol or short_name
     us_ticker = ticker.split(".")[0]
     tasks: list[tuple[str, object]] = []
@@ -64,6 +79,12 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
     tasks.append((bing_news.SOURCE_TYPE,
                   lambda: bing_news.fetch(short_name, company_name, days=days)))
 
+    # Not per-ticker and not US-only: one pull of the firehose serves every
+    # stock, and the wires carry European issuers the US sources never see.
+    tasks.append((wires.SOURCE_TYPE,
+                  lambda: wires.for_stock(short_name, company_name,
+                                          _alias_tuple(yahoo_symbol))))
+
     # Finviz, Nasdaq and EDGAR only carry US listings.
     if symbols.is_us_listing(exchange):
         tasks.append((finviz.SOURCE_TYPE, lambda: finviz.fetch(us_ticker)))
@@ -81,11 +102,19 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
         skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
                         sec_edgar.SOURCE_TYPE})
 
+    if only is not None:
+        tasks = [task for task in tasks if task[0] in only]
+        skipped &= only
+
     articles: list[dict] = []
     # Counted here rather than after the merge in refresh(): once the lists are
     # concatenated there is no telling which source produced what, and a source
     # returning nothing leaves no trace at all in the merged result.
     found: dict[str, int] = {}
+
+    if not tasks:
+        _record(found, skipped)
+        return articles
 
     with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="news") as pool:
         futures = [(source, pool.submit(task)) for source, task in tasks]
@@ -98,12 +127,15 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
             found[source] = found.get(source, 0) + len(batch)
             articles += batch
 
+    _record(found, skipped)
+    return articles
+
+
+def _record(found: dict[str, int], skipped: set[str]) -> None:
     try:
         db.sources.record(found, skipped)
     except Exception as exc:                 # telemetry must never fail a scrape
         print(f"[news] could not record source yield: {type(exc).__name__}: {exc}")
-
-    return articles
 
 
 def _aliases(stock: dict) -> tuple[str, ...]:
@@ -111,13 +143,17 @@ def _aliases(stock: dict) -> tuple[str, ...]:
 
     Trading212 calls Rocket Lab `6RJ0`; every article calls it `RKLB`.
     """
-    resolved = stock.get("yahoo_symbol") or ""
+    return _alias_tuple(stock.get("yahoo_symbol"))
+
+
+def _alias_tuple(yahoo_symbol: str | None) -> tuple[str, ...]:
+    resolved = yahoo_symbol or ""
     aliases = {resolved, resolved.split(".")[0]}
     return tuple(a for a in aliases if a)
 
 
 def refresh(short_name: str, days: int = 2, score: bool = True,
-            detect_events: bool = True) -> dict:
+            detect_events: bool = True, only: frozenset[str] | None = None) -> dict:
     """Scrape, dedupe and store news for one stock."""
     stock = db.stocks.get_stock(short_name) or {}
     company_name = stock.get("name") or short_name
@@ -125,10 +161,13 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
     raw = collect(
         short_name, company_name,
         stock.get("yahoo_symbol"), stock.get("exchange"),
-        days=days,
+        days=days, only=only,
     )
     if not raw:
-        print(f"[news] no source returned anything for {short_name}")
+        # The fast lane finds nothing on most ticks for most stocks. Saying so
+        # every two minutes per stock buries the hourly lane's output.
+        if only is None:
+            print(f"[news] no source returned anything for {short_name}")
         return {"short_name": short_name, "found": 0, "inserted": 0, "dropped": {}}
 
     existing = db.news.get_recent_fingerprints(short_name, days=max(days, 7))
@@ -143,6 +182,15 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
     for news_id, fields in prepared.enrichments.items():
         db.news.update_news(news_id, **fields)
 
+    # Before scoring and before the event pass, so both read the article
+    # instead of its headline. Best-effort, like images: a failed extraction
+    # leaves the row exactly as stored.
+    if inserted_ids:
+        try:
+            extract.fill_bodies(inserted_ids)
+        except Exception as exc:
+            print(f"[extract] {short_name} failed: {type(exc).__name__}: {exc}")
+
     if score and inserted_ids:
         sentiment_service.score_news_ids(inserted_ids)
 
@@ -154,8 +202,9 @@ def refresh(short_name: str, days: int = 2, score: bool = True,
         except Exception as exc:
             print(f"[events] {short_name} failed: {type(exc).__name__}: {exc}")
 
-    print(f"[news] {short_name}: {len(raw)} found -> {len(inserted_ids)} new "
-          f"(dropped {prepared.dropped}, enriched {len(prepared.enrichments)})")
+    if inserted_ids or only is None:
+        print(f"[news] {short_name}: {len(raw)} found -> {len(inserted_ids)} new "
+              f"(dropped {prepared.dropped}, enriched {len(prepared.enrichments)})")
 
     return {
         "short_name": short_name,
@@ -176,8 +225,12 @@ def backfill(short_name: str, days: int | None = None) -> dict:
     return result
 
 
-def refresh_watchlist(days: int = 2) -> dict:
-    """Hourly job across every followed stock."""
+def refresh_watchlist(days: int = 2, only: frozenset[str] | None = None,
+                      detect_events: bool = True) -> dict:
+    """Scheduled sweep across every followed stock.
+
+    `only=FAST_SOURCES` is the two-minute lane; the default is the hourly one.
+    """
     watched = db.watchlist.get_symbols()
     if not watched:
         return {"stocks": 0, "inserted": 0}
@@ -185,12 +238,16 @@ def refresh_watchlist(days: int = 2) -> dict:
     total_inserted = 0
     for short_name in watched:
         try:
-            total_inserted += refresh(short_name, days=days)["inserted"]
+            total_inserted += refresh(short_name, days=days, only=only,
+                                      detect_events=detect_events)["inserted"]
         except Exception as exc:
             print(f"[news] {short_name} failed: {type(exc).__name__}: {exc}")
 
-    images.backfill_images(watched)
-    prune()
+    # Both cost a fetch per article and a filing carries no image, so the
+    # fast lane stores and moves on. Pruning is a daily concern either way.
+    if only is None:
+        images.backfill_images(watched)
+        prune()
 
     print(f"[news] refresh complete: {total_inserted} new articles across {len(watched)} stocks")
     return {"stocks": len(watched), "inserted": total_inserted}

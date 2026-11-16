@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import HTTPException, Query
 from pydantic import BaseModel
 
-from normalize import clean_symbol, valid_symbol
+from normalize import clean_symbol, now_utc, valid_symbol
 
 MAX_SYMBOLS = 50
 MAX_LIMIT = 500
@@ -29,6 +29,14 @@ class Stock(BaseModel):
     change: Optional[float] = None
     changePercent: Optional[float] = None
     priceUpdatedAt: Optional[str] = None
+    # ISO date, and 'pre' | 'post' for which side of the bell. Absent for a
+    # non-US listing, which is a null rather than a failure.
+    nextEarningsDate: Optional[str] = None
+    nextEarningsTime: Optional[str] = None
+    # Reddit mentions now, and the 24h change. A separate signal from
+    # sentiment: loudness and tone are different axes.
+    socialMentions: Optional[int] = None
+    socialMentionsChange: Optional[int] = None
 
 
 class StockList(BaseModel):
@@ -255,7 +263,27 @@ def to_stock(row: dict) -> Stock:
         change=row.get("price_change"),
         changePercent=row.get("price_change_percent"),
         priceUpdatedAt=row.get("price_updated_at"),
+        **_upcoming_earnings(row),
+        socialMentions=row.get("social_mentions"),
+        socialMentionsChange=_mention_change(row),
     )
+
+
+def _mention_change(row: dict) -> int | None:
+    """The delta is the signal. A stock is always mentioned somewhat, and
+    the level mostly measures market cap."""
+    now, before = row.get("social_mentions"), row.get("social_mentions_prev")
+    return None if now is None or before is None else now - before
+
+
+def _upcoming_earnings(row: dict) -> dict:
+    """A date that has passed is not upcoming. The daily sweep rewrites
+    these, but between runs a date can fall into the past."""
+    date = row.get("next_earnings_date")
+    if not date or str(date) < now_utc().date().isoformat():
+        return {}
+    return {"nextEarningsDate": str(date),
+            "nextEarningsTime": row.get("next_earnings_time")}
 
 
 def to_news(row: dict) -> NewsArticle:

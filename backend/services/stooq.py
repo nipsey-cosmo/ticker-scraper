@@ -84,6 +84,14 @@ def history(yahoo_symbol: str, range_: str = "1mo") -> list[dict]:
     if not response or not response.ok:
         return []
 
+    # An anti-bot interstitial arrives as a 200 carrying HTML, so "not CSV"
+    # has to be told apart from "no data for this symbol". Both give no bars,
+    # but only one of them means the fallback itself is down — and a fallback
+    # that quietly stops falling back is worse than one that says so.
+    if "<html" in response.text[:200].lower():
+        print(f"[stooq] {symbol}: got a page, not CSV — the download is blocked")
+        return []
+
     since = days_ago_iso(_RANGE_DAYS.get(range_, _DEFAULT_RANGE_DAYS))[:10]
     return [bar for bar in parse_csv(response.text) if bar["ts"][:10] >= since]
 
