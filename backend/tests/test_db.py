@@ -287,6 +287,51 @@ class TestStocks:
         assert db.stocks.search_stocks("") == []
 
 
+class TestPriceBars:
+    """OHLCV storage. `upsert_points` takes a bare (ts, close) tuple as well as
+    a full bar, because most callers genuinely have nothing but a close."""
+
+    def test_a_full_bar_round_trips(self, temp_db):
+        db.prices.upsert_points("AAPL", [{
+            "ts": "2026-07-29T00:00:00Z", "close": 338.19, "open": 331.0,
+            "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }])
+        bar = db.prices.get_history("AAPL", "2026-07-01")[0]
+        assert (bar["open"], bar["high"], bar["low"]) == (331.0, 341.0, 330.5)
+        assert bar["volume"] == 52_500_000
+
+    def test_a_tuple_still_works_and_leaves_the_bar_null(self, temp_db):
+        db.prices.upsert_points("AAPL", [("2026-07-29T00:00:00Z", 338.19)])
+        bar = db.prices.get_history("AAPL", "2026-07-01")[0]
+        assert bar["close"] == 338.19
+        assert (bar["open"], bar["high"], bar["low"], bar["volume"]) == (None,) * 4
+
+    def test_a_later_close_only_write_does_not_blank_the_bar(self, temp_db):
+        """A snapshot landing on a slot that already holds a full bar must
+        correct the close and leave the OHLC alone."""
+        db.prices.upsert_points("AAPL", [{
+            "ts": "2026-07-29T00:00:00Z", "close": 338.19,
+            "open": 331.0, "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }])
+        db.prices.upsert_points("AAPL", [("2026-07-29T00:00:00Z", 339.00)])
+        bar = db.prices.get_history("AAPL", "2026-07-01")[0]
+        assert bar["close"] == 339.00
+        assert bar["high"] == 341.0 and bar["volume"] == 52_500_000
+
+    def test_a_bar_with_no_close_is_skipped(self, temp_db):
+        db.prices.upsert_points("AAPL", [{"ts": "2026-07-29T00:00:00Z", "close": None,
+                                          "volume": 1}])
+        assert db.prices.get_history("AAPL", "2026-07-01") == []
+
+    def test_mixed_shapes_in_one_batch(self, temp_db):
+        db.prices.upsert_points("AAPL", [
+            ("2026-07-28T00:00:00Z", 340.08),
+            {"ts": "2026-07-29T00:00:00Z", "close": 338.19, "volume": 52_500_000},
+        ])
+        assert [b["volume"] for b in db.prices.get_history("AAPL", "2026-07-01")] == \
+            [None, 52_500_000]
+
+
 class TestPrices:
     def test_upsert_is_idempotent(self, temp_db):
         points = [("2026-07-28T00:00:00Z", 340.08), ("2026-07-29T00:00:00Z", 338.19)]

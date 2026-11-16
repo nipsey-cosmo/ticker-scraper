@@ -48,31 +48,60 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
     """Every source's articles for one stock, unmerged."""
     ticker = yahoo_symbol or short_name
     us_ticker = ticker.split(".")[0]
-    tasks = []
+    tasks: list[tuple[str, object]] = []
+    skipped: set[str] = set()
 
     # Google News: the only source that can reach back more than a few days.
     if days > 3:
-        tasks.append(lambda: google_news.fetch_backfill(short_name, company_name, days=days))
+        tasks.append((google_news.SOURCE_TYPE,
+                      lambda: google_news.fetch_backfill(short_name, company_name, days=days)))
     else:
-        tasks.append(lambda: google_news.fetch_recent(short_name, company_name, days=days))
+        tasks.append((google_news.SOURCE_TYPE,
+                      lambda: google_news.fetch_recent(short_name, company_name, days=days)))
 
-    tasks.append(lambda: yahoo_news.fetch_search(ticker))
-    tasks.append(lambda: yahoo_news.fetch_rss(ticker))
-    tasks.append(lambda: bing_news.fetch(short_name, company_name, days=days))
+    tasks.append((yahoo_news.SEARCH_TYPE, lambda: yahoo_news.fetch_search(ticker)))
+    tasks.append((yahoo_news.RSS_TYPE, lambda: yahoo_news.fetch_rss(ticker)))
+    tasks.append((bing_news.SOURCE_TYPE,
+                  lambda: bing_news.fetch(short_name, company_name, days=days)))
 
     # Finviz, Nasdaq and EDGAR only carry US listings.
     if symbols.is_us_listing(exchange):
-        tasks.append(lambda: finviz.fetch(us_ticker))
-        tasks.append(lambda: nasdaq_news.fetch(us_ticker))
-        tasks.append(lambda: sec_edgar.fetch(us_ticker, company_name))
+        tasks.append((finviz.SOURCE_TYPE, lambda: finviz.fetch(us_ticker)))
+        tasks.append((nasdaq_news.SOURCE_TYPE, lambda: nasdaq_news.fetch(us_ticker)))
+        # EDGAR declines itself when no contact address is configured. Left to
+        # run it would report as a source that answered with nothing, which is
+        # the exact signal a dead scraper gives — so the skip is named here
+        # instead.
+        if settings.sec_enabled():
+            tasks.append((sec_edgar.SOURCE_TYPE,
+                          lambda: sec_edgar.fetch(us_ticker, company_name)))
+        else:
+            skipped.add(sec_edgar.SOURCE_TYPE)
+    else:
+        skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
+                        sec_edgar.SOURCE_TYPE})
 
     articles: list[dict] = []
+    # Counted here rather than after the merge in refresh(): once the lists are
+    # concatenated there is no telling which source produced what, and a source
+    # returning nothing leaves no trace at all in the merged result.
+    found: dict[str, int] = {}
+
     with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="news") as pool:
-        for future in [pool.submit(t) for t in tasks]:
+        futures = [(source, pool.submit(task)) for source, task in tasks]
+        for source, future in futures:
             try:
-                articles += future.result() or []
+                batch = future.result() or []
             except Exception as exc:
-                print(f"[news] a source failed for {short_name}: {type(exc).__name__}: {exc}")
+                print(f"[news] {source} failed for {short_name}: {type(exc).__name__}: {exc}")
+                batch = []
+            found[source] = found.get(source, 0) + len(batch)
+            articles += batch
+
+    try:
+        db.sources.record(found, skipped)
+    except Exception as exc:                 # telemetry must never fail a scrape
+        print(f"[news] could not record source yield: {type(exc).__name__}: {exc}")
 
     return articles
 

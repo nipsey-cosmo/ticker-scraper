@@ -207,3 +207,81 @@ class TestSecEdgar:
         assert sec_edgar.is_material("DEF 14A")
         assert not sec_edgar.is_material("4")
         assert not sec_edgar.is_material("SC 13G/A")
+
+
+class TestCollectionAccounting:
+    """`collect` is where per-source attribution still exists — after the merge
+    in `refresh` there is no telling which source produced what, and a source
+    that returned nothing leaves no trace at all."""
+
+    @staticmethod
+    def _quiet(monkeypatch):
+        """Every source stubbed to return nothing, so the test is about the
+        accounting rather than about parsing."""
+        from services import news as news_pkg
+        for module, names in (
+            (news_pkg.google_news, ("fetch_recent", "fetch_backfill")),
+            (news_pkg.yahoo_news, ("fetch_search", "fetch_rss")),
+            (news_pkg.bing_news, ("fetch",)),
+            (news_pkg.finviz, ("fetch",)),
+            (news_pkg.nasdaq_news, ("fetch",)),
+            (news_pkg.sec_edgar, ("fetch",)),
+        ):
+            for name in names:
+                monkeypatch.setattr(module, name, lambda *a, **kw: [])
+
+    def test_a_us_listing_asks_every_source(self, temp_db, monkeypatch):
+        import db
+        from services import news as news_pkg
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+
+        news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS")
+
+        rows = {r["source_type"]: r for r in db.sources.yields()}
+        assert set(rows) == {"GOOGLE_NEWS", "YAHOO_SEARCH", "YAHOO_RSS",
+                             "BING_NEWS", "FINVIZ", "NASDAQ", "SEC_EDGAR"}
+        assert all(r["fetches"] == 1 and r["skips"] == 0 for r in rows.values())
+
+    def test_a_london_listing_records_the_us_sources_as_skipped(self, temp_db, monkeypatch):
+        """Not as failures. Otherwise every non-US stock reports three dead
+        scrapers and the signal is worthless."""
+        import db
+        from services import news as news_pkg
+        self._quiet(monkeypatch)
+
+        news_pkg.collect("SHEL", "Shell plc", "SHEL.L", "LSE")
+
+        rows = {r["source_type"]: r for r in db.sources.yields()}
+        for source in ("FINVIZ", "NASDAQ", "SEC_EDGAR"):
+            assert rows[source]["skips"] == 1, source
+            assert rows[source]["fetches"] == 0, source
+            assert rows[source]["stalled"] is False, source
+        assert rows["GOOGLE_NEWS"]["fetches"] == 1
+
+    def test_edgar_without_a_contact_address_is_skipped_not_failed(self, temp_db, monkeypatch):
+        import db
+        from services import news as news_pkg
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: False)
+
+        news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS")
+
+        edgar = {r["source_type"]: r for r in db.sources.yields()}["SEC_EDGAR"]
+        assert edgar["skips"] == 1 and edgar["fetches"] == 0
+
+    def test_a_source_that_raises_is_counted_as_a_barren_fetch(self, temp_db, monkeypatch):
+        """It went out and produced nothing, which is exactly what `stalled`
+        is meant to surface."""
+        import db
+        from services import news as news_pkg
+        self._quiet(monkeypatch)
+
+        def boom(*a, **kw):
+            raise RuntimeError("selector gone")
+
+        monkeypatch.setattr(news_pkg.bing_news, "fetch", boom)
+        news_pkg.collect("SHEL", "Shell plc", "SHEL.L", "LSE")
+
+        bing = {r["source_type"]: r for r in db.sources.yields()}["BING_NEWS"]
+        assert bing["fetches"] == 1 and bing["articles"] == 0 and bing["stalled"] is True

@@ -71,7 +71,11 @@ def chart(symbol: str, range_: str = "1mo", interval: str = "1d") -> dict | None
 
     Returns:
         {"symbol", "exchange", "currency", "price", "previous_close",
-         "change", "change_percent", "points": [(iso_ts, close)]}
+         "change", "change_percent",
+         "points": [{"ts", "close", "open", "high", "low", "volume"}]}
+
+    Every field of a point except `ts` and `close` may be None: the feed has
+    holes, and a hole is not a zero.
     """
     data = _try_hosts(
         _CHART_HOSTS,
@@ -99,17 +103,34 @@ def parse_chart(data: dict) -> dict | None:
 
     stamps = node.get("timestamp") or []
     quote_blocks = ((node.get("indicators") or {}).get("quote") or [{}])
-    closes = (quote_blocks[0] or {}).get("close") or []
+    bars = quote_blocks[0] or {}
+    closes = bars.get("close") or []
+    opens, highs, lows = bars.get("open"), bars.get("high"), bars.get("low")
+    volumes = bars.get("volume")
 
-    points: list[tuple[str, float]] = []
-    for ts, close in zip(stamps, closes):
+    # A bar with no close is a market holiday and is skipped entirely. The
+    # other four are independent: Yahoo will happily hand back a real close
+    # with a null high, so each is read separately and stored as nullable
+    # rather than defaulted to zero, which would render as a real trade.
+    points: list[dict] = []
+    for index, (ts, close) in enumerate(zip(stamps, closes)):
         if close is None or ts is None:
-            continue          # market holiday / missing bar
-        points.append((_iso_from_epoch(ts), round(close / divisor, 6)))
+            continue
+        points.append({
+            "ts": _iso_from_epoch(ts),
+            "close": round(close / divisor, 6),
+            "open": _major(_at(opens, index), divisor),
+            "high": _major(_at(highs, index), divisor),
+            "low": _major(_at(lows, index), divisor),
+            # Volume is a share count, not money. Dividing it by the
+            # minor-unit divisor would report a hundredth of the real
+            # turnover on every LSE line.
+            "volume": _shares(_at(volumes, index)),
+        })
 
     price = meta.get("regularMarketPrice")
     if price is None and points:
-        price = points[-1][1] * divisor
+        price = points[-1]["close"] * divisor
     if price is None:
         return None
     price = price / divisor
@@ -118,7 +139,7 @@ def parse_chart(data: dict) -> dict | None:
     # before the window; the prior bar is the last resort.
     previous = meta.get("previousClose")
     if previous is None and len(points) >= 2:
-        previous = points[-2][1] * divisor
+        previous = points[-2]["close"] * divisor
     if previous is None:
         previous = meta.get("chartPreviousClose")
     previous = (previous / divisor) if previous else None
@@ -127,6 +148,8 @@ def parse_chart(data: dict) -> dict | None:
     change_percent = (
         round((change / previous) * 100, 3) if previous and change is not None else None
     )
+
+    dividends, splits = _corporate_actions(node, divisor)
 
     return {
         "symbol": meta.get("symbol"),
@@ -139,7 +162,72 @@ def parse_chart(data: dict) -> dict | None:
         "change": change,
         "change_percent": change_percent,
         "points": points,
+        "dividends": dividends,
+        "splits": splits,
     }
+
+
+def _corporate_actions(node: dict, divisor: float) -> tuple[list[dict], list[dict]]:
+    """The `events` block the chart call has always asked for and never read.
+
+    Yahoo keys both maps by epoch second, so the payload is
+    `{"dividends": {"1785072600": {"amount": .., "date": ..}}, "splits": {...}}`.
+    """
+    events = node.get("events")
+    if not isinstance(events, dict):
+        return [], []
+
+    dividends = []
+    for entry in (events.get("dividends") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        amount, stamp = entry.get("amount"), entry.get("date")
+        if amount is None or stamp is None:
+            continue
+        # A dividend is money, quoted in the same minor unit as the price, so
+        # an LSE payout arrives in pence and has to come down with everything
+        # else. Volume is the only field here that must *not* be scaled.
+        dividends.append({"ex_date": _iso_from_epoch(stamp)[:10],
+                          "amount": round(amount / divisor, 6)})
+
+    splits = []
+    for entry in (events.get("splits") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        numerator = entry.get("numerator")
+        denominator = entry.get("denominator")
+        stamp = entry.get("date")
+        if not numerator or not denominator or stamp is None:
+            continue
+        splits.append({"ex_date": _iso_from_epoch(stamp)[:10],
+                       "numerator": float(numerator),
+                       "denominator": float(denominator)})
+
+    dividends.sort(key=lambda d: d["ex_date"])
+    splits.sort(key=lambda s: s["ex_date"])
+    return dividends, splits
+
+
+def _at(series, index):
+    """One bar out of one series, tolerating a series that is short or absent."""
+    if not isinstance(series, list) or index >= len(series):
+        return None
+    return series[index]
+
+
+def _major(value, divisor: float) -> float | None:
+    """A price field converted to major units. None stays None."""
+    return None if value is None else round(value / divisor, 6)
+
+
+def _shares(value) -> int | None:
+    """Volume, as a whole number of shares. Never scaled by the divisor."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_from_epoch(seconds: int) -> str:

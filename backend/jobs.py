@@ -60,7 +60,10 @@ def prune() -> dict:
     """Daily. Keep the DB bounded."""
     articles = news.prune()
     points = db.prices.delete_older_than(days_ago_iso(400))
-    return {"articles": articles, "price_points": points}
+    # /health only ever asks for the last week of yields; a year of daily rows
+    # per source is already generous for looking back at when a source died.
+    yields = db.sources.delete_older_than(days_ago_iso(365)[:10])
+    return {"articles": articles, "price_points": points, "source_yields": yields}
 
 
 # ── On demand ────────────────────────────────────────────────────────────

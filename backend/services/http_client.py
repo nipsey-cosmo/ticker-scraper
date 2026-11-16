@@ -22,6 +22,13 @@ How it pushes throughput without getting blocked:
   connection instead of re-handshaking. HTTP/1.1 only — see `http2=False`.
 * **Short-lived response cache**, so several scrapers wanting the same feed in
   one refresh cost one request.
+* **Conditional GET.** An entry outlives its own freshness so its `ETag` /
+  `Last-Modified` can go back out as `If-None-Match` / `If-Modified-Since`.
+  A feed that hasn't changed then answers **304 with no body at all** — far
+  cheaper for the host than re-sending a hundred kilobytes we already have,
+  and it buys headroom in the rate limiter above for the fetches that do carry
+  something new. Most hourly polls of an RSS feed find nothing new, so most of
+  them should cost nothing.
 
 Deliberately not here: proxy rotation, CAPTCHA solving, or anything that
 defeats an access control rather than sharing a host's capacity fairly. Where a
@@ -104,6 +111,10 @@ _HOST_RATES: dict[str, tuple[float, float]] = {
     "www.nasdaq.com": (1.0, 3.0),
     "www.sec.gov": (2.0, 8.0),
     "quote.cnbc.com": (2.0, 6.0),
+    # A CSV download rather than an API, and a small operation. Kept low
+    # deliberately: it is a fallback, so it only runs when something else has
+    # already failed, and it never needs to be fast.
+    "stooq.com": (0.5, 2.0),
 }
 _DEFAULT_RATE = (1.5, 4.0)
 _MIN_RATE = 0.2
@@ -221,6 +232,7 @@ class Scraper:
         host = _host_of(url)
         state = self._state(host)
         attempts = (retries if retries is not None else self.max_retries) + 1
+        conditional = self._validators(cache_key) if cache else None
 
         for attempt in range(attempts):
             if not self._acquire(state):
@@ -228,7 +240,8 @@ class Scraper:
 
             try:
                 response = self._client.get(
-                    url, params=params, headers=self._headers(state, headers)
+                    url, params=params,
+                    headers=self._headers(state, headers, conditional),
                 )
             except httpx.HTTPError as exc:
                 self._on_failure(state)
@@ -249,6 +262,18 @@ class Scraper:
                     return None
                 self._sleep(_retry_after(response) or self._backoff(attempt))
                 continue
+
+            # 304: the feed is unchanged, so the copy we already hold *is* the
+            # answer. The cheapest possible poll — no body crosses the wire —
+            # and a clean signal for the limiter: the host answered, it simply
+            # had nothing new to send.
+            #
+            # If the entry has since been evicted there is no body to hand
+            # back, so this falls through and the caller gets a non-ok 304,
+            # which reads as "this source had nothing" like any other miss.
+            if response.status_code == 304 and (fresh := self._revalidate(cache_key)):
+                self._on_success(state)
+                return fresh
 
             # A 404 is a real answer, not evidence we can go faster. Letting it
             # count made miss-heavy traffic (symbols.resolve tries up to four
@@ -407,10 +432,15 @@ class Scraper:
 
     # ── headers / cache ──────────────────────────────────────────────────
 
-    def _headers(self, state: _HostState, extra: dict | None) -> dict:
+    def _headers(self, state: _HostState, extra: dict | None,
+                 conditional: dict | None = None) -> dict:
         headers = {**_BASE_HEADERS, **_FINGERPRINTS[state.fingerprint]}
         if extra:
             headers.update(extra)
+        # Last, so a caller can never accidentally clobber a validator with a
+        # stale one of its own.
+        if conditional:
+            headers.update(conditional)
         return headers
 
     @staticmethod
@@ -420,30 +450,90 @@ class Scraper:
         return url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
 
     def _cache_get(self, key: str) -> Fetched | None:
+        """The body, only while it is still fresh.
+
+        A stale entry is *kept*, not dropped: its body is too old to serve, but
+        the ETag on it is exactly what proves the next fetch can be a 304. See
+        `_validators`.
+        """
         if self.cache_ttl <= 0:
             return None
         with self._cache_lock:
             entry = self._cache.get(key)
             if not entry:
                 return None
-            expiry, value = entry
-            if expiry < self._clock():
-                del self._cache[key]
+            fresh_until, value = entry
+            if fresh_until < self._clock():
                 return None
-        return Fetched(value.url, value.status, value.text, value.content,
-                       value.headers, from_cache=True)
+        return _copy_from_cache(value)
+
+    def _validators(self, key: str) -> dict | None:
+        """Conditional-request headers for a URL we have fetched before.
+
+        Deliberately reads entries whose freshness has expired — that is the
+        whole point. A body goes stale after `cache_ttl`; the validator that
+        can prove it is still current does not, and an hourly poll is far
+        outside any sane body TTL.
+
+        httpx lower-cases response header names, which is what makes the plain
+        lookups below safe.
+        """
+        if self.cache_ttl <= 0:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+        if not entry:
+            return None
+
+        _, value = entry
+        conditional = {}
+        if etag := value.headers.get("etag"):
+            conditional["If-None-Match"] = etag
+        if modified := value.headers.get("last-modified"):
+            conditional["If-Modified-Since"] = modified
+        return conditional or None
+
+    def _revalidate(self, key: str) -> Fetched | None:
+        """A 304 arrived: mark the held body fresh again and hand it back.
+
+        Never writes the 304 into the entry. A 304 carries no body, so storing
+        it would replace a good page with an empty one — the one way this
+        optimisation could corrupt rather than merely miss.
+        """
+        if self.cache_ttl <= 0:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if not entry:
+                return None
+            _, value = entry
+            self._cache[key] = (self._clock() + self.cache_ttl, value)
+        return _copy_from_cache(value)
 
     def _cache_put(self, key: str, value: Fetched) -> None:
         if self.cache_ttl <= 0:
             return
         with self._cache_lock:
-            if len(self._cache) > 512:          # ponytail: crude cap, it's a
-                self._cache.clear()             # 5-minute cache, not a store
+            # ponytail: entries now outlive their freshness so validators
+            # survive, which makes this a bounded store rather than a
+            # 5-minute cache. Clearing wholesale costs one uncached cycle and
+            # then rebuilds; swap for LRU eviction if that ever shows up in a
+            # profile. The realistic population is sources × watchlist, a few
+            # hundred, so the cap is a backstop and not a working limit.
+            if len(self._cache) > 1024:
+                self._cache.clear()
             self._cache[key] = (self._clock() + self.cache_ttl, value)
 
     def clear_cache(self) -> None:
         with self._cache_lock:
             self._cache.clear()
+
+
+def _copy_from_cache(value: Fetched) -> Fetched:
+    """A detached copy flagged as cached, so a caller mutating it can't poison
+    the entry the next revalidation will serve."""
+    return Fetched(value.url, value.status, value.text, value.content,
+                   value.headers, from_cache=True)
 
 
 def _host_of(url: str) -> str:

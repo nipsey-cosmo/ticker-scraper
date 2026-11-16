@@ -143,6 +143,31 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (short_name, ts, interval)
 );
 
+-- Corporate actions, from the `events` block of Yahoo's chart response.
+--
+-- `splits` is not just a display table: it is the idempotency record for the
+-- back-adjustment. A split makes every price before it incomparable with
+-- every price after it, so stored history has to be divided through when one
+-- lands — and doing that twice would halve the series again. The primary key
+-- is what makes "have we already applied this one?" a question the database
+-- answers rather than the application guessing.
+CREATE TABLE IF NOT EXISTS splits (
+    short_name  TEXT NOT NULL,
+    ex_date     TEXT NOT NULL,              -- YYYY-MM-DD UTC
+    numerator   DOUBLE PRECISION NOT NULL,  -- 4 and 1 for a 4:1 split
+    denominator DOUBLE PRECISION NOT NULL,
+    applied_at  TEXT NOT NULL DEFAULT {_NOW},
+    PRIMARY KEY (short_name, ex_date)
+);
+
+CREATE TABLE IF NOT EXISTS dividends (
+    short_name TEXT NOT NULL,
+    ex_date    TEXT NOT NULL,               -- YYYY-MM-DD UTC
+    amount     DOUBLE PRECISION NOT NULL,   -- major units, like every price here
+    currency   TEXT,
+    PRIMARY KEY (short_name, ex_date)
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     short_name    TEXT PRIMARY KEY,
     created_at    TEXT NOT NULL DEFAULT {_NOW},
@@ -186,6 +211,25 @@ CREATE TABLE IF NOT EXISTS events (
     tokens_total     INTEGER NOT NULL DEFAULT 0
 );
 
+-- How much each news source actually returned, per day.
+--
+-- In the database rather than a process counter because the refreshes run in
+-- the scheduler process and /health is served by the API: an in-memory tally
+-- would be written by one and read by the other, which is to say never read.
+--
+-- `skips` is what stops the alerting crying wolf. Three of the seven sources
+-- are US-only and one is off unless a contact address is configured, so a
+-- source can legitimately return nothing all day without being broken. A
+-- source that *ran* and returned nothing is the one worth looking at.
+CREATE TABLE IF NOT EXISTS source_yield (
+    source_type TEXT NOT NULL,
+    date        TEXT NOT NULL,              -- YYYY-MM-DD UTC
+    articles    INTEGER NOT NULL DEFAULT 0,
+    fetches     INTEGER NOT NULL DEFAULT 0, -- times it actually went out
+    skips       INTEGER NOT NULL DEFAULT 0, -- times it was skipped by design
+    PRIMARY KEY (source_type, date)
+);
+
 -- Runtime feature flags set from the UI (db/flags.py). Deliberately not in
 -- the notify trigger list below: a flag change is answered to the client that
 -- made it, and pushing it would make every other tab re-fetch the whole feed
@@ -194,11 +238,6 @@ CREATE TABLE IF NOT EXISTS app_config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL             -- '1' | '0'
 );
-
--- CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a new column
--- on an old database needs its own idempotent statement or the app runs on the
--- old shape while the tests pass.
-ALTER TABLE news ADD COLUMN IF NOT EXISTS impact TEXT;
 
 -- Change notification for the /ws push channel (routes/ws.py).
 --
@@ -217,6 +256,32 @@ BEGIN
     RETURN NULL;
 END;
 $fn$ LANGUAGE plpgsql;
+"""
+
+# There is no migration framework here, and adding one for a single-user local
+# tool would be more machinery than the problem deserves. What the problem does
+# need is a home: `CREATE TABLE IF NOT EXISTS` leaves an existing table alone,
+# so a column added to _SCHEMA never reaches a database that already has the
+# table — the app then runs on the old shape while the tests, which build from
+# scratch, pass happily.
+#
+# So: every column added after a table first shipped gets a line here as well.
+# `ADD COLUMN IF NOT EXISTS` is idempotent, runs under the same advisory lock,
+# and costs a catalogue lookup per start.
+#
+# ponytail: append-only, and never reorder — this is a migration list wearing a
+# smaller hat. Reach for a real framework the day one of these needs a data
+# backfill rather than a default.
+_ALTERS = """
+ALTER TABLE news   ADD COLUMN IF NOT EXISTS impact TEXT;
+
+-- Yahoo returns the full bar in the same payload as the close; storing only
+-- `close` meant no candlesticks and, worse, no volume — which is the number
+-- that says whether a headline actually mattered.
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS open   DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS high   DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS low    DOUBLE PRECISION;
+ALTER TABLE prices ADD COLUMN IF NOT EXISTS volume BIGINT;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for
@@ -246,5 +311,6 @@ def create_tables() -> None:
     with get_connection() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
         conn.execute(_SCHEMA)
+        conn.execute(_ALTERS)
         conn.execute(_INDEXES)
         conn.execute(_TRIGGERS)

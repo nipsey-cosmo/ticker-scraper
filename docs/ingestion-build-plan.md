@@ -25,9 +25,13 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 
 | Part | Branch | Base | Commits | State |
 |---|---|---|---|---|
-| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 0 / 5 | not started |
-| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | blocked on 1 |
+| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
+| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 0 / 6 | ready |
 | 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | blocked on 2 |
+
+Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
+`eslint` clean. Live smoke on 5100/3100 passed — all seven news sources
+returned articles, real OHLCV stored, no console errors on `/` or `/graphs`.
 
 ---
 
@@ -38,7 +42,14 @@ modes. Two of these five just stop discarding data already in hand.
 
 ### 1.1 — A1 · Conditional GET
 
-- [ ] `feat: send conditional GET so an unchanged feed costs a 304`
+- [x] `feat: send conditional GET so an unchanged feed costs a 304`
+
+**Done.** One dict, not two: the entry is `(fresh_until, Fetched)` and is kept
+past `fresh_until` rather than deleted, so the body goes stale while its
+validator does not. That satisfies "validators outlive `cache_ttl`" with one
+lookup method instead of two parallel stores — and it means a 304 always has a
+body to hand back, which two stores would not have guaranteed. Cap raised
+512 → 1024 because entries now live longer.
 
 **Files** `backend/services/http_client.py`, `backend/tests/test_http_client.py`
 
@@ -60,7 +71,15 @@ returns the first body, and that the request carried `If-None-Match`.
 
 ### 1.2 — C1 · Store OHLC and volume
 
-- [ ] `feat: store open, high, low and volume, not just the close`
+- [x] `feat: store open, high, low and volume, not just the close`
+
+**Done.** `_ALTERS` now exists in `db/connection.py` as the home for every
+post-ship column (the lone `news.impact` ALTER moved into it), so 1.3 and 3.1
+get their schema changes for one line each. `parse_chart` emits dicts rather
+than `(ts, close)` tuples; `upsert_points` accepts **both** shapes, because 20
+existing call sites genuinely only have a close and making them all build a
+dict would be noise. The update path `COALESCE`s OHLC so a snapshot landing on
+a bar's slot corrects the close without blanking the rest.
 
 **Files** `backend/services/yahoo.py`, `backend/db/prices.py`,
 `backend/db/connection.py`, `backend/services/prices.py`,
@@ -89,7 +108,20 @@ skipped rather than stored as zero.
 
 ### 1.3 — C2 · Splits and dividends
 
-- [ ] `feat: read the splits and dividends the chart call already asks for`
+- [x] `feat: read the splits and dividends the chart call already asks for`
+
+**Done.** Idempotency is the `splits` table's primary key, not application
+logic: `record_split` returns True only on first sight and the adjustment is
+gated on it, so the database answers "have we applied this?" rather than the
+code guessing.
+
+The subtle part turned out to be **ordering**, not the arithmetic. Yahoo
+returns the requested window already split-adjusted, so incoming bars are on
+the new scale while stored ones are not. `_store` therefore adjusts *before*
+inserting: adjust-then-insert moves only the stale rows, insert-then-adjust
+would divide the fresh bars a second time. `adjust_for_split` uses `ts <
+ex_date` so the ex-date bar itself, which already arrived rescaled, is left
+alone.
 
 **Files** `backend/services/yahoo.py`, `backend/db/connection.py`,
 `backend/db/prices.py`, `backend/tests/test_prices.py`
@@ -112,7 +144,25 @@ same payload through twice leaves the series unchanged.
 
 ### 1.4 — C3 · Stooq as history fallback
 
-- [ ] `feat: fall back to Stooq for history when Yahoo has none`
+- [x] `feat: fall back to Stooq for history when Yahoo has none`
+
+**Done, but not where the plan said.** Putting the backfill in `get_quote`
+worked and was wrong twice over: it made a pure function hit the network, and
+because the price job ticks every five minutes while a market is open, one
+Yahoo outage would have meant a full CSV download **per stock per tick** for a
+file that changes once a day. It moved to `refresh_stock`, gated on the stored
+daily series having no bar within `_HISTORY_GRACE_DAYS` (4, so Friday's close
+still counts on Monday).
+
+The full suite caught it and the isolated file did not — three older
+`TestFallbackChain` tests build quotes with no `points` key, so they silently
+started making live requests to stooq.com. Worth remembering: running only the
+file you touched can hide a change that widens what other tests reach for.
+
+Suffix map is deliberately narrow (`us`, `uk`, `de`, `jp`, `pl`, `hu`). German
+regional venues are left unmapped on purpose — `.MU` onto `.de` is the same
+company at a different venue, and a fallback that quietly swaps venues is
+worse than one that declines.
 
 **Files** `backend/services/stooq.py` (new), `backend/services/prices.py`,
 `backend/tests/test_prices.py`
@@ -138,7 +188,18 @@ quote source returned none.
 
 ### 1.5 — E1 · Per-source yield metrics
 
-- [ ] `feat: report articles per source so a dead feed stops looking like quiet news`
+- [x] `feat: report articles per source so a dead feed stops looking like quiet news`
+
+**Done.** Counts live in a `source_yield` table, not process memory, because
+the refreshes run in the **scheduler** process and `/health` is served by the
+**API** — an in-memory tally would be written by one and read by the other.
+`stalled` is computed over the 7-day window rather than the last attempt, so a
+source finding nothing for one quiet stock is not an alarm.
+
+The skip accounting matters more than expected: EDGAR declines itself inside
+`fetch()` when no contact address is set, which reads externally as "answered
+with nothing" — the exact signature of a dead scraper. `collect` now checks
+`sec_enabled()` before queuing it and records the skip explicitly.
 
 **Files** `backend/services/news/__init__.py`, `backend/routes/system.py`,
 `backend/tests/test_api.py`

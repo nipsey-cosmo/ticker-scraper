@@ -4,19 +4,29 @@
     2. Nasdaq quote    — US listings, real-time during the session, own host
     3. CNBC quote API  — independent host, no key, global coverage
 
+History has its own fallback, because the chain above does not cover it: only
+Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
+chart quietly frozen. Stooq (services/stooq.py) fills that gap — end-of-day
+CSV, no key — and is deliberately outside the chain, since it cannot answer
+what something is trading at right now.
+
 Three different operators, hit through the adaptive scraper, so a throttled
 Yahoo drops its rate and the next source picks up the slack rather than the
 refresh failing. Diversifying across suppliers is what keeps this polite:
 nobody is being leaned on hard enough to notice, and no proxy or IP rotation
 is needed to stay welcome.
 
-History comes from Yahoo only. If Yahoo is unavailable the quote still updates
-from a fallback and the stored history simply stops extending — degraded, not
-broken.
+So a throttled Yahoo now costs neither the quote nor the chart: the quote
+fails over to Nasdaq or CNBC, and the bars come from Stooq.
 
 Everything is stored in *major* currency units: LSE quotes arrive in pence and
 Tel Aviv in agorot, and a chart that silently mixes 3323.5 with 33.235 is worse
 than no chart.
+
+Corporate actions ride along on the same Yahoo response. Dividends are stored;
+splits additionally rescale the history already on disk, because a refresh only
+re-fetches a few days and every older row would otherwise stay on the pre-split
+scale — a cliff in the chart that no source agrees with.
 """
 from __future__ import annotations
 
@@ -28,7 +38,7 @@ import db
 import settings
 from normalize import days_ago_iso, now_utc, to_iso
 
-from . import symbols, yahoo
+from . import stooq, symbols, yahoo
 from .http_client import scraper
 
 _CNBC_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
@@ -193,7 +203,13 @@ def _cnbc_quote(symbol: str) -> dict | None:
 
 
 def get_quote(yahoo_symbol: str, range_: str = "1mo") -> dict | None:
-    """Walk the chain. None only if every source failed."""
+    """Walk the chain. None only if every source failed.
+
+    Stooq is deliberately *not* here. It is end-of-day only, so it cannot
+    answer the "what is it trading at now" question this chain exists for, and
+    deciding whether history needs topping up needs the database — see
+    `_stooq_backfill`.
+    """
     return (from_yahoo(yahoo_symbol, range_=range_)
             or from_nasdaq(yahoo_symbol)
             or from_cnbc(yahoo_symbol))
@@ -267,17 +283,56 @@ def refresh_stock(short_name: str, range_: str = "5d") -> dict | None:
         print(f"[prices] all sources failed for {short_name} ({yahoo_symbol})")
         return None
 
+    if not quote.get("points"):
+        quote["points"] = _stooq_backfill(short_name, yahoo_symbol, range_)
+
     _store(short_name, quote)
     return quote
 
 
+# A daily bar can legitimately be this old and still be current: Friday's close
+# is the newest thing that exists until Monday, and a public holiday stretches
+# that further.
+_HISTORY_GRACE_DAYS = 4
+
+
+def _stooq_backfill(short_name: str, yahoo_symbol: str, range_: str) -> list[dict]:
+    """Bars for a quote that arrived without them — Nasdaq and CNBC never
+    return any, so a Yahoo outage otherwise freezes the chart silently.
+
+    Gated on the stored series actually having fallen behind, and that gate is
+    the point rather than an optimisation: this runs inside the five-minute
+    price job, and Stooq is a small operation serving an end-of-day CSV.
+    Ungated, one Yahoo outage would mean a full history download per stock
+    every five minutes, all day, for a file that changes once.
+    """
+    recent = db.prices.get_history(
+        short_name, days_ago_iso(_HISTORY_GRACE_DAYS), interval="1d")
+    if recent:
+        return []
+
+    bars = stooq.history(yahoo_symbol, range_=range_)
+    if bars:
+        print(f"[prices] {short_name}: history had gone stale, "
+              f"{len(bars)} bars from stooq")
+    return bars
+
+
 def _store(short_name: str, quote: dict) -> None:
+    # Before the points, and that ordering is the whole trick. Yahoo returns
+    # the requested window *already* split-adjusted, so incoming bars are on
+    # the new scale while rows stored before the split are still on the old
+    # one. Adjusting first moves only the stale rows; the fresh ones then land
+    # on top at the scale they arrived in. Insert first and the adjustment
+    # would divide the new bars through a second time.
+    _store_corporate_actions(short_name, quote)
+
     if quote.get("points"):
         # Daily bars are stamped at midnight UTC so one trading day is one row
         # regardless of which session time the exchange reports.
         db.prices.upsert_points(
             short_name,
-            [(ts[:10] + "T00:00:00Z", close) for ts, close in quote["points"]],
+            [{**bar, "ts": bar["ts"][:10] + "T00:00:00Z"} for bar in quote["points"]],
             interval="1d",
         )
 
@@ -290,6 +345,30 @@ def _store(short_name: str, quote: dict) -> None:
         "change_percent": quote.get("change_percent"),
         "currency": quote.get("currency"),
     }])
+
+
+def _store_corporate_actions(short_name: str, quote: dict) -> None:
+    """Record dividends, and bring history onto the scale of any new split.
+
+    `record_split` is the guard: it returns True only for a split we have not
+    seen, so the adjustment below runs exactly once per event no matter how
+    many refreshes carry it. Without that, every hourly refresh for the next
+    month would halve the same history again.
+    """
+    if dividends := quote.get("dividends"):
+        db.prices.upsert_dividends(short_name, dividends, quote.get("currency"))
+
+    for split in quote.get("splits") or []:
+        ratio = split["numerator"] / split["denominator"]
+        if ratio == 1:
+            continue
+        if not db.prices.record_split(short_name, split["ex_date"],
+                                      split["numerator"], split["denominator"]):
+            continue                                   # already applied
+        moved = db.prices.adjust_for_split(short_name, split["ex_date"], ratio)
+        print(f"[prices] {short_name}: {split['numerator']:g}:"
+              f"{split['denominator']:g} split on {split['ex_date']}, "
+              f"adjusted {moved} stored bars")
 
 
 def _store_snapshot(short_name: str, price: float) -> None:

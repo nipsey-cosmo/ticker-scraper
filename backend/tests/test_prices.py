@@ -8,15 +8,25 @@ from __future__ import annotations
 
 import pytest
 
-from services import prices, yahoo
+from services import prices, stooq, yahoo
 
 
-def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None):
+def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, stamps=None,
+                  events=None, **bars):
+    """`bars` takes open/high/low/volume series.
+
+    Omitting them is the common case and is itself worth exercising: Yahoo
+    sends `close` alone often enough that the parser must not assume the other
+    four series are present.
+    """
     closes = closes if closes is not None else [330.0, 336.91, 340.08, 338.19]
     stamps = stamps if stamps is not None else [1785072600, 1785159000, 1785245400, 1785331800]
+    quote = {"close": closes, **{k: v for k, v in bars.items() if v is not None}}
+    node_extra = {"events": events} if events else {}
     return {
         "chart": {
             "result": [{
+                **node_extra,
                 "meta": {
                     "symbol": "TEST", "exchangeName": "NMS", "fullExchangeName": "NasdaqGS",
                     "instrumentType": "EQUITY", "currency": currency,
@@ -24,7 +34,7 @@ def chart_payload(currency="USD", price=338.19, previous=340.08, closes=None, st
                     "chartPreviousClose": 320.0,
                 },
                 "timestamp": stamps,
-                "indicators": {"quote": [{"close": closes}]},
+                "indicators": {"quote": [quote]},
             }],
             "error": None,
         }
@@ -76,7 +86,7 @@ class TestParseChart:
         assert parsed["currency"] == "GBP"
         assert parsed["price"] == pytest.approx(33.235)
         assert parsed["previous_close"] == pytest.approx(32.345)
-        assert parsed["points"][-1][1] == pytest.approx(33.235)
+        assert parsed["points"][-1]["close"] == pytest.approx(33.235)
         # Percentage change must be unaffected by the unit conversion.
         assert parsed["change_percent"] == pytest.approx(2.752, abs=1e-2)
 
@@ -84,11 +94,60 @@ class TestParseChart:
         parsed = yahoo.parse_chart(
             chart_payload(closes=[330.0, None, 340.08, None], stamps=[1, 2, 3, 4])
         )
-        assert [p[1] for p in parsed["points"]] == [330.0, 340.08]
+        assert [p["close"] for p in parsed["points"]] == [330.0, 340.08]
 
     def test_timestamps_become_canonical_iso(self):
         parsed = yahoo.parse_chart(chart_payload())
-        assert parsed["points"][-1][0] == "2026-07-29T13:30:00Z"
+        assert parsed["points"][-1]["ts"] == "2026-07-29T13:30:00Z"
+
+    def test_full_bars_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 338.19], stamps=[1, 2],
+            open=[328.0, 331.0], high=[335.0, 341.0], low=[327.0, 330.5],
+            volume=[41_000_000, 52_500_000],
+        ))
+        assert parsed["points"][-1] == {
+            "ts": "1970-01-01T00:00:02Z", "close": 338.19,
+            "open": 331.0, "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }
+
+    def test_pence_divides_the_prices_and_never_the_volume(self):
+        """Volume is a share count. Scaling it would report a hundredth of the
+        real turnover on every LSE line."""
+        parsed = yahoo.parse_chart(chart_payload(
+            currency="GBp", price=3323.5, previous=3234.5,
+            closes=[3323.5], stamps=[1],
+            open=[3300.0], high=[3350.0], low=[3290.0], volume=[8_000_000],
+        ))
+        bar = parsed["points"][0]
+        assert (bar["open"], bar["high"], bar["low"]) == (33.0, 33.5, 32.9)
+        assert bar["volume"] == 8_000_000
+
+    def test_a_close_only_payload_leaves_the_rest_none(self):
+        """Yahoo often sends `close` alone; the other series must not be
+        assumed present."""
+        bar = yahoo.parse_chart(chart_payload(closes=[330.0], stamps=[1]))["points"][0]
+        assert bar["close"] == 330.0
+        assert (bar["open"], bar["high"], bar["low"], bar["volume"]) == (None,) * 4
+
+    def test_a_hole_in_one_series_does_not_cost_the_bar(self):
+        """A null high is a hole, not a holiday — the close still stands, and
+        the gap is stored NULL rather than defaulted to a trade at zero."""
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 338.19], stamps=[1, 2],
+            open=[328.0, 331.0], high=[335.0, None], volume=[41_000_000, None],
+        ))
+        assert len(parsed["points"]) == 2
+        assert parsed["points"][-1]["high"] is None
+        assert parsed["points"][-1]["volume"] is None
+        assert parsed["points"][-1]["open"] == 331.0
+
+    def test_a_short_series_does_not_raise(self):
+        """The series are not guaranteed to be the same length as `close`."""
+        parsed = yahoo.parse_chart(chart_payload(
+            closes=[330.0, 336.91, 338.19], stamps=[1, 2, 3], volume=[41_000_000],
+        ))
+        assert [p["volume"] for p in parsed["points"]] == [41_000_000, None, None]
 
     def test_previous_close_falls_back_to_the_prior_bar(self):
         payload = chart_payload()
@@ -108,6 +167,273 @@ class TestParseChart:
         payload["chart"]["result"][0]["timestamp"] = []
         payload["chart"]["result"][0]["indicators"] = {"quote": [{"close": []}]}
         assert yahoo.parse_chart(payload) is None
+
+
+SPLIT_4_FOR_1 = {"splits": {"1785072600": {
+    "date": 1785072600, "numerator": 4, "denominator": 1, "splitRatio": "4:1",
+}}}
+
+DIVIDEND = {"dividends": {"1785072600": {"amount": 0.24, "date": 1785072600}}}
+
+
+class TestCorporateActions:
+    """The `events` block the chart call has always requested and never read."""
+
+    def test_dividends_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(events=DIVIDEND))
+        assert parsed["dividends"] == [{"ex_date": "2026-07-26", "amount": 0.24}]
+
+    def test_a_dividend_is_money_so_pence_are_converted(self):
+        parsed = yahoo.parse_chart(chart_payload(currency="GBp", events=DIVIDEND))
+        assert parsed["dividends"][0]["amount"] == pytest.approx(0.0024)
+
+    def test_splits_are_extracted(self):
+        parsed = yahoo.parse_chart(chart_payload(events=SPLIT_4_FOR_1))
+        assert parsed["splits"] == [
+            {"ex_date": "2026-07-26", "numerator": 4.0, "denominator": 1.0}
+        ]
+
+    def test_no_events_block_is_not_an_error(self):
+        parsed = yahoo.parse_chart(chart_payload())
+        assert parsed["dividends"] == [] and parsed["splits"] == []
+
+    @pytest.mark.parametrize("events", [
+        {"splits": {"1": {"date": 1, "numerator": 0, "denominator": 1}}},
+        {"splits": {"1": {"date": 1, "numerator": 4}}},
+        {"splits": {"1": "not a dict"}},
+        {"dividends": {"1": {"date": 1}}},
+    ])
+    def test_malformed_events_are_skipped_not_raised(self, events):
+        parsed = yahoo.parse_chart(chart_payload(events=events))
+        assert parsed["dividends"] == [] and parsed["splits"] == []
+
+
+class TestSplitAdjustment:
+    """A split makes every price before it incomparable with every price after.
+    Adjusting once is correct; adjusting twice is a 16x error on a 4:1."""
+
+    @staticmethod
+    def _seed(short_name="AAPL"):
+        import db
+        db.prices.upsert_points(short_name, [
+            {"ts": "2026-07-24T00:00:00Z", "close": 400.0, "open": 396.0,
+             "high": 404.0, "low": 395.0, "volume": 10_000_000},
+            {"ts": "2026-07-25T00:00:00Z", "close": 440.0, "open": 430.0,
+             "high": 444.0, "low": 428.0, "volume": 12_000_000},
+        ])
+
+    def _quote(self):
+        return {"price": 110.0, "change": 0.0, "change_percent": 0.0,
+                "currency": "USD", "points": [], "dividends": [],
+                "splits": [{"ex_date": "2026-07-26", "numerator": 4.0,
+                            "denominator": 1.0}]}
+
+    def test_history_before_the_ex_date_is_brought_onto_the_new_scale(self, stocked_db):
+        import db
+        self._seed()
+        prices._store("AAPL", self._quote())
+
+        bars = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+        assert [b["close"] for b in bars] == [100.0, 110.0]
+        assert [b["high"] for b in bars] == [101.0, 111.0]
+        # Four times the shares at a quarter of the price.
+        assert [b["volume"] for b in bars] == [40_000_000, 48_000_000]
+
+    def test_applying_the_same_split_twice_changes_nothing(self, stocked_db):
+        """The one way this could corrupt the series rather than merely miss."""
+        import db
+        self._seed()
+        prices._store("AAPL", self._quote())
+        after_once = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+
+        for _ in range(3):                       # three more refreshes carry it
+            prices._store("AAPL", self._quote())
+
+        assert db.prices.get_history("AAPL", "2026-07-01", interval="1d") == after_once
+
+    def test_bars_on_or_after_the_ex_date_are_left_alone(self, stocked_db):
+        """They already arrived on the post-split scale."""
+        import db
+        db.prices.upsert_points("AAPL", [
+            {"ts": "2026-07-25T00:00:00Z", "close": 440.0},
+            {"ts": "2026-07-26T00:00:00Z", "close": 110.0},
+            {"ts": "2026-07-27T00:00:00Z", "close": 112.0},
+        ])
+        prices._store("AAPL", self._quote())
+
+        assert [b["close"] for b in db.prices.get_history("AAPL", "2026-07-01",
+                                                          interval="1d")] == \
+            [110.0, 110.0, 112.0]
+
+    def test_a_one_for_one_split_is_ignored(self, stocked_db):
+        import db
+        self._seed()
+        quote = {**self._quote(), "splits": [
+            {"ex_date": "2026-07-26", "numerator": 1.0, "denominator": 1.0}]}
+        prices._store("AAPL", quote)
+        assert db.prices.get_splits("AAPL") == []
+
+    def test_dividends_are_stored_and_re_run_cleanly(self, stocked_db):
+        import db
+        quote = {**self._quote(), "splits": [],
+                 "dividends": [{"ex_date": "2026-07-26", "amount": 0.24}]}
+        prices._store("AAPL", quote)
+        prices._store("AAPL", quote)
+
+        stored = db.prices.get_dividends("AAPL")
+        assert len(stored) == 1
+        assert stored[0]["amount"] == 0.24 and stored[0]["currency"] == "USD"
+
+
+STOOQ_CSV = """Date,Open,High,Low,Close,Volume
+2026-08-17,328.00,335.00,327.00,330.00,41000000
+2026-08-18,331.00,341.00,330.50,338.19,52500000
+"""
+
+
+class TestStooqSymbols:
+    """Mapping is the whole job. A wrong symbol does not fail — it silently
+    backfills the chart with another venue's prices."""
+
+    @pytest.mark.parametrize("yahoo_symbol,expected", [
+        ("AAPL", "aapl.us"),
+        ("SHEL.L", "shel.uk"),
+        ("SAP.DE", "sap.de"),
+        ("7203.T", "7203.jp"),
+    ])
+    def test_known_venues_map(self, yahoo_symbol, expected):
+        assert stooq.to_stooq(yahoo_symbol) == expected
+
+    @pytest.mark.parametrize("yahoo_symbol", [
+        "SHEL.MU",      # Munich — same company, different venue, different price
+        "BHP.AX",       # Sydney — Stooq does not carry it
+        "^GSPC",        # index, named differently there
+        "", "   ", ".L",
+    ])
+    def test_anything_unmapped_declines_rather_than_guesses(self, yahoo_symbol):
+        assert stooq.to_stooq(yahoo_symbol) is None
+
+
+class TestStooqParsing:
+    def test_bars_are_parsed_oldest_first(self):
+        bars = stooq.parse_csv(STOOQ_CSV)
+        assert [b["ts"] for b in bars] == \
+            ["2026-08-17T00:00:00Z", "2026-08-18T00:00:00Z"]
+        assert bars[-1] == {
+            "ts": "2026-08-18T00:00:00Z", "close": 338.19, "open": 331.0,
+            "high": 341.0, "low": 330.5, "volume": 52_500_000,
+        }
+
+    def test_the_no_data_body_is_not_a_bar(self):
+        """Stooq answers an unknown symbol with HTTP 200 and this body, so the
+        status code cannot be trusted."""
+        assert stooq.parse_csv("No data") == []
+
+    def test_a_row_with_no_close_is_skipped(self):
+        text = "Date,Open,High,Low,Close,Volume\n2026-08-18,331.00,341.00,330.50,,0\n"
+        assert stooq.parse_csv(text) == []
+
+    def test_empty_and_junk_bodies_are_safe(self):
+        assert stooq.parse_csv("") == []
+        assert stooq.parse_csv("<html>nope</html>") == []
+
+
+class TestStooqFetch:
+    @staticmethod
+    def _serving(text):
+        from services.http_client import Fetched
+        return lambda *a, **kw: Fetched(
+            url="https://stooq.com/q/d/l/", status=200, text=text,
+            content=text.encode(), headers={},
+        )
+
+    def test_history_drops_bars_older_than_the_requested_range(self, monkeypatch):
+        """Stooq hands back decades; storing all of it for a 1-month chart
+        would be a lot of rows nobody asked for."""
+        old = "Date,Open,High,Low,Close,Volume\n1999-01-04,1,1,1,1.23,100\n"
+        monkeypatch.setattr(stooq.scraper, "get", self._serving(old + STOOQ_CSV.split("\n", 1)[1]))
+        bars = stooq.history("AAPL", range_="1mo")
+        assert all(bar["ts"] > "2000" for bar in bars)
+
+    def test_an_unmapped_symbol_never_reaches_the_network(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(stooq.scraper, "get", lambda *a, **kw: called.append(1))
+        assert stooq.history("SHEL.MU") == []
+        assert not called
+
+
+class TestStooqBackfill:
+    """Runs in `refresh_stock`, not `get_quote`: deciding whether history has
+    fallen behind needs the database, and the gate is what stops a Yahoo
+    outage becoming a CSV download per stock every five minutes."""
+
+    @staticmethod
+    def _bar_less_quote(monkeypatch):
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_nasdaq", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_cnbc", lambda *a, **kw: {
+            "price": 338.19, "change": 0.0, "change_percent": 0.0,
+            "points": [], "source": "cnbc", "currency": "USD"})
+
+    def test_it_fills_history_when_the_stored_series_is_stale(self, stocked_db, monkeypatch):
+        """A CNBC quote carries no bars; without this the chart just freezes."""
+        import db
+        self._bar_less_quote(monkeypatch)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: stooq.parse_csv(STOOQ_CSV))
+
+        prices.refresh_stock("AAPL", range_="1mo")
+        stored = db.prices.get_history("AAPL", "2026-01-01", interval="1d")
+        assert [b["close"] for b in stored] == [330.0, 338.19]
+        assert [b["volume"] for b in stored] == [41_000_000, 52_500_000]
+
+    def test_a_current_series_is_not_re_downloaded(self, stocked_db, monkeypatch):
+        """The five-minute price job must not pull a daily CSV every tick."""
+        import db
+        from normalize import days_ago_iso
+        db.prices.upsert_points("AAPL", [
+            {"ts": days_ago_iso(1)[:10] + "T00:00:00Z", "close": 338.19}])
+
+        called = []
+        self._bar_less_quote(monkeypatch)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        prices.refresh_stock("AAPL", range_="5d")
+        assert not called
+
+    def test_a_source_with_its_own_bars_never_asks_stooq(self, stocked_db, monkeypatch):
+        called = []
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: {
+            "price": 338.19, "change": 0.0, "change_percent": 0.0,
+            "source": "yahoo", "currency": "USD",
+            "points": [{"ts": "2026-08-18T00:00:00Z", "close": 338.19}]})
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        prices.refresh_stock("AAPL")
+        assert not called
+
+    def test_every_source_failing_still_returns_none(self, stocked_db, monkeypatch):
+        """Stooq backfills a quote; it does not invent one."""
+        for name in ("from_yahoo", "from_nasdaq", "from_cnbc"):
+            monkeypatch.setattr(prices, name, lambda *a, **kw: None)
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: stooq.parse_csv(STOOQ_CSV))
+        assert prices.refresh_stock("AAPL") is None
+
+    def test_get_quote_alone_never_touches_the_network_for_history(self, monkeypatch):
+        """It is a pure three-source chain; the DB-aware half lives elsewhere."""
+        called = []
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_nasdaq", lambda *a, **kw: None)
+        monkeypatch.setattr(prices, "from_cnbc", lambda *a, **kw: {
+            "price": 1.0, "points": [], "source": "cnbc"})
+        monkeypatch.setattr(prices.stooq, "history",
+                            lambda *a, **kw: called.append(1) or [])
+
+        assert prices.get_quote("AAPL")["source"] == "cnbc"
+        assert not called
 
 
 class TestCnbcNumbers:
@@ -238,10 +564,14 @@ class TestStoring:
         import db
         prices._store("AAPL", {
             "price": 338.19, "change": -1.89, "change_percent": -0.556, "currency": "USD",
-            "points": [("2026-07-29T13:30:00Z", 338.19), ("2026-07-28T13:30:00Z", 340.08)],
+            "points": [
+                {"ts": "2026-07-29T13:30:00Z", "close": 338.19, "volume": 52_500_000},
+                {"ts": "2026-07-28T13:30:00Z", "close": 340.08, "volume": 41_000_000},
+            ],
         })
         bars = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
         assert [b["ts"] for b in bars] == ["2026-07-28T00:00:00Z", "2026-07-29T00:00:00Z"]
+        assert [b["volume"] for b in bars] == [41_000_000, 52_500_000]
 
     def test_quote_is_written_to_the_stock_row(self, stocked_db):
         import db
