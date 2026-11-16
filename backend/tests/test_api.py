@@ -11,7 +11,8 @@ from uuid import uuid4
 import pytest
 
 import db
-from normalize import now_iso
+# Fixture dates are relative to today: a fixed date ages out of the ?days= windows.
+from normalize import days_ago_iso, hours_ago_iso, now_iso
 
 
 class TestHealth:
@@ -205,11 +206,11 @@ class TestSectors:
             {"short_name": "6RJ0", "title": "Rocket Lab wins a launch contract",
              "title_key": "s1", "url": "https://mw.com/s1", "url_hash": "hs1",
              "source": "MarketWatch", "source_domain": "marketwatch.com",
-             "source_type": "FINVIZ", "publish_time": "2026-07-29T10:00:00Z"},
+             "source_type": "FINVIZ", "publish_time": days_ago_iso(2)},
             {"short_name": "AAPL", "title": "Apple ships a new phone",
              "title_key": "s2", "url": "https://mw.com/s2", "url_hash": "hs2",
              "source": "MarketWatch", "source_domain": "marketwatch.com",
-             "source_type": "FINVIZ", "publish_time": "2026-07-29T11:00:00Z"},
+             "source_type": "FINVIZ", "publish_time": days_ago_iso(1)},
         ])
 
     def test_lists_sectors_on_the_watchlist(self, client):
@@ -330,15 +331,15 @@ class TestNewsFeed:
             {"short_name": "AAPL", "title": "Apple beats Q3 estimates on iPhone demand",
              "title_key": "k1", "url": "https://reuters.com/1", "url_hash": "h1",
              "source": "Reuters", "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": "2026-07-29T10:00:00Z", "sentiment": 0.8, "relevance": "direct"},
+             "publish_time": days_ago_iso(1), "sentiment": 0.8, "relevance": "direct"},
             {"short_name": "AAPL", "title": "Apple faces an antitrust probe in Europe",
              "title_key": "k2", "url": "https://ft.com/2", "url_hash": "h2",
              "source": "FT", "source_domain": "ft.com", "source_type": "FINVIZ",
-             "publish_time": "2026-07-28T10:00:00Z", "sentiment": -0.7, "relevance": "direct"},
+             "publish_time": days_ago_iso(2), "sentiment": -0.7, "relevance": "direct"},
             {"short_name": "6RJ0", "title": "Space stocks slide after FAA news",
              "title_key": "k3", "url": "https://mw.com/3", "url_hash": "h3",
              "source": "MarketWatch", "source_domain": "marketwatch.com",
-             "source_type": "FINVIZ", "publish_time": "2026-07-27T10:00:00Z",
+             "source_type": "FINVIZ", "publish_time": days_ago_iso(3),
              "sentiment": -0.3, "relevance": "related"},
         ])
 
@@ -363,7 +364,7 @@ class TestNewsFeed:
         assert [r["short_name"] for r in results] == ["6RJ0"]
 
     def test_since_filter(self, client):
-        results = client.get("/news?since=2026-07-28T12:00:00Z").json()["results"]
+        results = client.get(f"/news?since={hours_ago_iso(36)}").json()["results"]
         assert len(results) == 1
 
     def test_bad_since_is_rejected(self, client):
@@ -386,7 +387,7 @@ class TestNewsFeed:
             {"short_name": "ZZZZ", "title": "Antitrust ruling hits an unfollowed stock",
              "title_key": "z1", "url": "https://ft.com/z1", "url_hash": "hz1",
              "source": "FT", "source_domain": "ft.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": "2026-07-29T09:00:00Z"},
+             "publish_time": days_ago_iso(1)},
         ])
         symbols = {r["short_name"] for r in
                    client.get("/news?days=365&q=antitrust").json()["results"]}
@@ -458,7 +459,7 @@ class TestNewsFeed:
             "short_name": "TSLA", "title": "Tesla opens a new gigafactory in Texas",
             "title_key": "kt", "url": "https://reuters.com/t", "url_hash": "ht",
             "source": "Reuters", "source_domain": "reuters.com",
-            "source_type": "GOOGLE_NEWS", "publish_time": "2026-07-29T09:00:00Z",
+            "source_type": "GOOGLE_NEWS", "publish_time": days_ago_iso(1),
             "relevance": "direct",
         }])
         assert "TSLA" not in db.watchlist.get_symbols()
@@ -524,18 +525,18 @@ class TestTrendingNews:
             {"short_name": "AAPL", "title": f"Apple story {i}", "title_key": f"a{i}",
              "url": f"https://reuters.com/a{i}", "url_hash": f"ha{i}", "source": "Reuters",
              "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": f"2026-07-3{i}T10:00:00Z", "relevance": "direct"}
+             "publish_time": days_ago_iso(10 - i), "relevance": "direct"}
             for i in range(5)
         ] + [
             {"short_name": "TSLA", "title": "Tesla surges on delivery beat", "title_key": "t1",
              "url": "https://reuters.com/t1", "url_hash": "ht1", "source": "Reuters",
              "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": "2026-07-30T10:00:00Z", "relevance": "direct"},
+             "publish_time": days_ago_iso(10), "relevance": "direct"},
             # 6RJ0 is followed but has no quote, so it has no move to rank by.
             {"short_name": "6RJ0", "title": "Rocket Lab wins a launch contract",
              "title_key": "r1", "url": "https://reuters.com/r1", "url_hash": "hr1",
              "source": "Reuters", "source_domain": "reuters.com",
-             "source_type": "GOOGLE_NEWS", "publish_time": "2026-07-30T11:00:00Z",
+             "source_type": "GOOGLE_NEWS", "publish_time": days_ago_iso(9),
              "relevance": "direct"},
         ])
 
@@ -688,13 +689,13 @@ class TestInsights:
             {"short_name": "AAPL", "title": f"Apple story number {i} about earnings",
              "title_key": f"a{i}", "url": f"https://reuters.com/a{i}", "url_hash": f"ha{i}",
              "source": "Reuters", "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": "2026-07-29T10:00:00Z", "sentiment": 0.6}
+             "publish_time": days_ago_iso(1), "sentiment": 0.6}
             for i in range(5)
         ] + [
             {"short_name": "6RJ0", "title": "Rocket Lab story about a launch failure",
              "title_key": "b1", "url": "https://reuters.com/b1", "url_hash": "hb1",
              "source": "Reuters", "source_domain": "reuters.com", "source_type": "GOOGLE_NEWS",
-             "publish_time": "2026-07-29T10:00:00Z", "sentiment": -0.7},
+             "publish_time": days_ago_iso(1), "sentiment": -0.7},
         ])
         db.sentiment.aggregate_all(days=100000)
 
