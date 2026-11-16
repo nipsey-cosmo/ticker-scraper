@@ -25,9 +25,9 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 
 | Part | Branch | Base | Commits | State |
 |---|---|---|---|---|
-| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
-| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 6 / 6 | **done, green, unmerged** |
-| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 6 / 6 | **done, green, unmerged** |
+| 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, merged in #7** |
+| 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 6 / 6 | **done, merged in #8** |
+| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 6 / 6 | **done, merged in #9** |
 
 Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
 `eslint` clean.
