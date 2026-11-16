@@ -1,8 +1,8 @@
-# Stocky
+# ticker-scraper
 
 <img width="1596" height="876" alt="image" src="https://github.com/user-attachments/assets/c86951d6-631d-436a-8d6b-a3b2959a4a69" />
 
-**A free, self-hosted stock news aggregator and price tracker.** Stocky watches
+**A free, self-hosted stock news aggregator and price tracker.** It watches
 the handful of companies you actually follow, pulls their news from five
 independent sources and their prices from three, throws away the duplicate
 coverage, and ranks what survives by how far the price moved today. It runs on
@@ -113,7 +113,7 @@ arrive as a Google News redirect with nothing behind them, so there is a
 
 ## The optional LLM
 
-Stocky is a scraper first. Set `DSEEK` to a DeepSeek key in `backend/.env` and
+The project is a scraper first. Set `DSEEK` to a DeepSeek key in `backend/.env` and
 you get two extras, both switchable from the AI settings dialog in the ticker
 strip. Everything else works without a key.
 
