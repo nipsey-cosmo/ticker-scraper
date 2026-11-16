@@ -27,7 +27,7 @@ Derived from the ingestion gap analysis (audit of `0c8bdf1`). Gap ids (`A1`,
 |---|---|---|---|---|
 | 1 · Stop leaving data on the table | `feat/tier-1-reclaim` | `main` | 5 / 5 | **done, green, unmerged** |
 | 2 · New capability | `feat/tier-2-capability` | `feat/tier-1-reclaim` | 6 / 6 | **done, green, unmerged** |
-| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 0 / 6 | ready |
+| 3 · Justified by evidence | `feat/tier-3-evidence` | `feat/tier-2-capability` | 6 / 6 | **done, green, unmerged** |
 
 Suite at the end of Part 1: **670 backend** (from 609), **128 frontend**,
 `eslint` clean.
@@ -45,9 +45,46 @@ watchlist company in that window — recorded as `WIRES fetches=11 articles=0`,
 which is the honest answer for a 63-item snapshot, not a dead source. No
 console errors on `/` or `/graphs`.
 
-**Carried into Part 3:** 3.4 is no longer speculative — two hosts are
-actively refusing (stooq.com, accessnewswire.com). The evidence is written
-into that sub-point.
+Suite at the end of Part 3: **830 backend passed + 15 skipped** (the live
+suite, opt-in), **128 frontend / 15 files**, `eslint` clean.
+
+Live smoke on 5100/3100 passed. `/health` 200 over the 11-stock watchlist,
+CORS naming 3100, frontend rendering, `storyId` present on the feed. Over one
+refresh: **761 5m bars** across 11 stocks, all carrying volume; attribution
+measured live (AAPL **+0.021%** on 1.16x volume, TSLA **-1.202%** on 1.31x,
+both 14:00 -> 16:00); **79 rows linked into 38 cross-stock stories**, the
+largest spanning AAPL/MSFT/NVDA/TSLA; **219 insider counter rows** (VRT 37
+form 4s in one month); **35 full-text hits** including "HP INC names Nvidia in
+its 10-Q", exactly the supply-chain case B7 was for. RNS was asked only for
+the non-US listings (`fetches=2 skips=9`) and matched nothing in a 53-item
+window — the honest firehose answer, as WIRES gave in Part 2.
+
+Two bugs the smoke caught and fixed, both after their sub-point's commit:
+`currentTradingPeriod` is the current *or next* session, so pre-open it named
+today while `range=1d` returned yesterday's bars and the filter dropped all 79;
+and efts reports the exhibit (`EX-99.1`) in `file_type` where the parent form
+lives in `form`.
+
+**Carried out of Part 3 — 3.4's premise was half right.** The transport works
+and both paths pass the same limiter tests, but the two hosts behave
+differently:
+
+- **accessnewswire.com** — impersonation *does* get through: its flat 403
+  becomes a real answer. No `_FEEDS` entry was added, because the feed URL
+  guessed from the site (`/newsroom/en/rss`) 404s. Finding the real one is the
+  remaining work, and it is now worth doing.
+- **stooq.com** — still blocked, with or without a Chrome fingerprint. Its
+  check is a JavaScript browser-check page, not a TLS fingerprint, so no
+  transport swap defeats it. **1.4's history fallback stays dead**, and the
+  assumption that 3.4 would revive it was wrong. Getting past a JS challenge
+  is the proxy/CAPTCHA territory `http_client.py` deliberately refuses, so the
+  answer here is another end-of-day source, not more transport work.
+
+**Deferred, named:** the semantic pass (3.2) ships off. It needs
+`STOCKY_EMBED_MODEL` and `--extras semantic`, which pulls torch — the same
+call this repo already made for FinBERT. Its behaviour is covered by unit
+tests with an injected embedder; there is no live evidence for it in the smoke
+because nothing ran it.
 
 ---
 
@@ -552,7 +589,7 @@ ticker and asserts a non-empty parse.
 
 ### 3.1 — C4 · Intraday bars and news-to-move attribution
 
-- [ ] `feat: pull 5m bars so an event can be checked against the move`
+- [x] `feat: pull 5m bars so an event can be checked against the move`
 
 **Files** `backend/services/yahoo.py`, `backend/services/prices.py`,
 `backend/db/prices.py`, `backend/services/events.py`,
@@ -581,7 +618,7 @@ and daily rows on the long one.
 
 ### 3.2 — D2 · Embedding dedup for the semantic tail
 
-- [ ] `feat: catch rewrites that share a story but not a vocabulary`
+- [x] `feat: catch rewrites that share a story but not a vocabulary`
 
 **Files** `backend/services/dedup.py`, `backend/db/connection.py`,
 `pyproject.toml`, `backend/tests/test_dedup.py`
@@ -605,7 +642,7 @@ stories about one stock do not.
 
 ### 3.3 — D3 · Cross-stock story linking
 
-- [ ] `feat: link one story across every stock it touches`
+- [x] `feat: link one story across every stock it touches`
 
 **Files** `backend/db/connection.py`, `backend/services/news/__init__.py`,
 `backend/routes/news.py`, `backend/tests/test_dedup.py`
@@ -626,7 +663,7 @@ URLs do not.
 
 ### 3.4 — A2 · curl_cffi transport
 
-- [ ] `feat: allow a browser TLS fingerprint when a host starts refusing`
+- [x] `feat: allow a browser TLS fingerprint when a host starts refusing`
 
 **Files** `backend/services/http_client.py`, `backend/settings.py`,
 `pyproject.toml`, `backend/tests/test_http_client.py`
@@ -658,7 +695,7 @@ tests.
 
 ### 3.5 — B6 + B7 · Insider aggregates and EDGAR full-text
 
-- [ ] `feat: count insider filings and search what other filings say about us`
+- [x] `feat: count insider filings and search what other filings say about us`
 
 **Files** `backend/services/news/sec_edgar.py`, `backend/db/connection.py`,
 `backend/routes/stocks.py`, `backend/tests/test_news_sources.py`
@@ -683,7 +720,7 @@ naming another filer is attributed to the right stock.
 
 ### 3.6 — B3 · RNS and non-US filings
 
-- [ ] `feat: read UK regulatory announcements`
+- [x] `feat: read UK regulatory announcements`
 
 **Files** `backend/services/news/rns.py` (new),
 `backend/services/news/__init__.py`, `backend/tests/test_news_parsers.py`

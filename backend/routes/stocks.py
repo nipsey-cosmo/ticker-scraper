@@ -153,6 +153,18 @@ def detail(symbol: str):
     return to_stock(row)
 
 
+@router.get("/{symbol}/insiders")
+def insiders(symbol: str, months: int = Query(6, ge=1, le=24)):
+    """Insider filing counts per month — forms 3, 4, 5 and 13F.
+
+    Counts rather than articles, and that is the point: these are dozens a
+    month and were filtered out of the feed for good reason, but "four insider
+    filings this month against none last month" is worth showing as a badge.
+    """
+    symbol = require_symbol(symbol)
+    return {"results": db.insiders.get_activity(symbol, months=months)}
+
+
 @router.get("/{symbol}/prices", response_model=PriceSeries)
 def price_history(symbol: str, days: int = Query(30, ge=1, le=365)):
     """Daily closes plus intraday snapshots for days without a close yet."""

@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS news (
     id             UUID PRIMARY KEY DEFAULT uuidv7(),
     created_at     TEXT NOT NULL DEFAULT {_NOW},
     short_name     TEXT NOT NULL,
+    -- Shared by every row carrying the same canonical URL for a different
+    -- stock. NULL means this story touches one stock, which is most of them.
+    story_id       UUID,
     source         TEXT NOT NULL,
     source_url     TEXT,
     source_domain  TEXT,
@@ -208,7 +211,37 @@ CREATE TABLE IF NOT EXISTS events (
     previously_known TEXT,            -- NULL when genuinely fresh
     impact           TEXT NOT NULL,   -- 'high' | 'medium' | 'low'
     news_ids         UUID[] NOT NULL, -- backing articles
-    tokens_total     INTEGER NOT NULL DEFAULT 0
+    tokens_total     INTEGER NOT NULL DEFAULT 0,
+    -- What the stock did over the trading window that followed. A *window*,
+    -- never an instant: scraped publish timestamps are only good to the hour,
+    -- so `move_from_ts` and `move_to_ts` are stated rather than implied and no
+    -- consumer should read this as "the price at the moment of the news".
+    -- NULL means not yet attributed (the window has not closed, or no intraday
+    -- bars covered it) — deliberately distinct from an attributed 0.0.
+    move_from_ts     TEXT,
+    move_to_ts       TEXT,
+    move_percent     DOUBLE PRECISION,
+    move_volume_x    DOUBLE PRECISION  -- window's volume vs a median 5m bar
+);
+
+-- Insider paperwork, counted rather than published.
+--
+-- Forms 3/4/5 arrive in the same submissions payload as the 8-Ks and were
+-- being thrown away. They are dozens a month and would swamp the feed, which
+-- is why they are filtered out of it — but "four insiders sold this month" is
+-- a real signal, it is just a badge rather than a headline. 13F is the same
+-- shape at quarterly cadence.
+--
+-- Counts are absolute, not incremental: a refresh recounts the filings in the
+-- scanned window and writes the total, so re-running it is a no-op instead of
+-- doubling every number.
+CREATE TABLE IF NOT EXISTS insider_activity (
+    short_name TEXT NOT NULL,
+    month      TEXT NOT NULL,               -- YYYY-MM UTC
+    form       TEXT NOT NULL,               -- '3' | '4' | '5' | '13F'
+    filings    INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT {_NOW},
+    PRIMARY KEY (short_name, month, form)
 );
 
 -- How much each news source actually returned, per day.
@@ -298,6 +331,24 @@ ALTER TABLE stocks ADD COLUMN IF NOT EXISTS next_earnings_time TEXT;
 -- well it reads are different axes, and averaging them destroys both.
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions      INT;
 ALTER TABLE stocks ADD COLUMN IF NOT EXISTS social_mentions_prev INT;
+
+-- Did the stock actually move on this? Four columns rather than one because
+-- a bare percentage would be unreadable without the window it was measured
+-- over, and the window is the honest part of the claim.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_from_ts  TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_to_ts    TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_percent  DOUBLE PRECISION;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS move_volume_x DOUBLE PRECISION;
+
+-- One story, every stock it touches. Dedup is scoped to a single stock by
+-- design, so a supplier story affecting three holdings is three rows with
+-- nothing connecting them. This is assigned *after* storage and changes no
+-- clustering decision: it is a label on rows that already exist, which is what
+-- makes it zero risk to the filter that produced them.
+--
+-- Holds the id of the earliest row in the group, so it is a real news id
+-- rather than a synthetic key, and re-running the assignment is a no-op.
+ALTER TABLE news ADD COLUMN IF NOT EXISTS story_id UUID;
 """
 
 # CREATE OR REPLACE TRIGGER needs PG 14+; the schema already requires 18 for
@@ -315,6 +366,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_news_stock_url    ON news(short_name, url_
 CREATE INDEX        IF NOT EXISTS idx_news_stock_time   ON news(short_name, publish_time DESC);
 CREATE INDEX        IF NOT EXISTS idx_news_time         ON news(publish_time DESC);
 CREATE INDEX        IF NOT EXISTS idx_news_stock_key    ON news(short_name, title_key);
+CREATE INDEX        IF NOT EXISTS idx_news_url_hash     ON news(url_hash);
+CREATE INDEX        IF NOT EXISTS idx_news_story        ON news(story_id) WHERE story_id IS NOT NULL;
 CREATE INDEX        IF NOT EXISTS idx_prices_stock_ts   ON prices(short_name, ts);
 CREATE INDEX        IF NOT EXISTS idx_summaries_stock   ON stock_ai_summaries(short_name, created_at DESC);
 CREATE INDEX        IF NOT EXISTS idx_events_stock_time  ON events(short_name, created_at DESC);

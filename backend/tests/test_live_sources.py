@@ -25,7 +25,7 @@ import pytest
 import settings
 from services import calendar, prices, social, stooq, yahoo
 from services.news import (bing_news, finviz, google_news, nasdaq_news,
-                           sec_edgar, wires, yahoo_news)
+                           rns, sec_edgar, wires, yahoo_news)
 
 # Liquid, US-listed, and covered by everything. A quiet ticker would make an
 # empty result ambiguous, which is exactly what these tests exist to avoid.
@@ -77,6 +77,28 @@ class TestNewsSources:
         if not settings.sec_enabled():
             pytest.skip("STOCKY_SEC_CONTACT not set")
         _plausible(sec_edgar.fetch(TICKER, COMPANY), "sec edgar")
+
+    def test_sec_edgar_full_text(self):
+        if not settings.sec_enabled():
+            pytest.skip("STOCKY_SEC_CONTACT not set")
+        # Not `_plausible`: a week with nobody naming Apple in a 10-K is a real
+        # answer, so this asks whether the index answers, not whether it hit.
+        assert isinstance(sec_edgar.full_text(TICKER, COMPANY), list)
+
+    def test_rns(self):
+        """The firehose again, and a UK one — so this asks whether the index
+        answers at all, not whether it mentions a US ticker today.
+
+        This is the test that earns its keep most: the parser reads permalink
+        structure off a live HTML page, and the fixture beside it is synthetic
+        (Investegate's terms cover their content, and this repo is public), so
+        nothing else in the suite would notice the real page changing shape.
+        """
+        rns.reset_cache()
+        try:
+            _plausible(rns.fetch(), "rns")
+        finally:
+            rns.reset_cache()
 
 
 @pytest.mark.live

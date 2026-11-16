@@ -303,8 +303,14 @@ class TestStockDetail:
         assert client.get("/stocks/..%2Fetc").status_code == 404
 
     def test_price_history_shape(self, client):
+        # Dated relative to today, not fixed: a hardcoded pair eventually ages
+        # past the ?days= window and the test starts failing on a calendar
+        # boundary rather than on a code change.
+        from normalize import days_ago_iso
+
         db.prices.upsert_points("AAPL", [
-            ("2026-07-28T00:00:00Z", 340.08), ("2026-07-29T00:00:00Z", 338.19)])
+            (days_ago_iso(3)[:10] + "T00:00:00Z", 340.08),
+            (days_ago_iso(2)[:10] + "T00:00:00Z", 338.19)])
         body = client.get("/stocks/AAPL/prices?days=30").json()
         assert body["symbol"] == "AAPL"
         assert body["currency"] == "USD"

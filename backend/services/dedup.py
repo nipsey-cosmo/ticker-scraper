@@ -13,6 +13,9 @@ What happens now:
 
 * Deduplication is scoped to **one stock and a ±72 hour window** — the only
   scope in which two similar headlines are actually the same story.
+* A third, **semantic** pass then catches the tail the first two cannot: a
+  rewrite that shares the story but none of the vocabulary. It runs over
+  cluster winners only, inside the same stock and the same window.
 * Identity is a **canonical URL hash** (tracking parameters stripped), enforced
   by a DB unique index rather than a fuzzy scan.
 * Near-duplicates are **clustered**, and each cluster elects a winner by source
@@ -37,6 +40,7 @@ from datetime import timedelta
 
 from rapidfuzz import fuzz
 
+import settings
 from normalize import (
     domain_of,
     now_utc,
@@ -47,6 +51,8 @@ from normalize import (
     to_iso,
     url_hash,
 )
+
+from . import embeddings
 
 # Two headlines are the same story if they share a normalised key, or read
 # almost the same. token_set_ratio already ignores word order and padding, so
@@ -351,7 +357,93 @@ def prepare(
         clusters.append(article)
         result.rows.append(_to_row(article))
 
+    _semantic_pass(result, clusters, stored)
     return result
+
+
+# ── Third pass: the semantic tail ────────────────────────────────────────
+
+def _semantic_pass(result: Prepared, clusters: list[dict],
+                   stored: list[dict]) -> None:
+    """Merge winners that report one story in two vocabularies.
+
+    `token_set_ratio` cannot match "Nvidia beats on Q3 revenue" to "Chipmaker
+    tops estimates, shares jump 6%" — same story, near-zero token overlap — and
+    no threshold fixes that, because the overlap genuinely is not there.
+
+    Runs **after** the two lexical passes and changes none of their decisions.
+    They are cheap and catch the bulk; this is a tail-catcher bolted on the end,
+    which is also what keeps it cheap: it only ever sees cluster winners, a few
+    dozen titles for one stock, rather than every scraped article.
+
+    Scope is deliberately unchanged — one stock, ±72 hours. A semantic pass
+    across stocks is exactly the over-broad matching that killed the original
+    build, only harder to notice, because two different companies' earnings
+    stories are genuinely similar in every respect except which company they
+    are about.
+
+    A no-op when no model is installed, which is the default.
+    """
+    if not clusters or not embeddings.available():
+        return
+
+    vectors = embeddings.embed([_embed_text(a) for a in clusters + stored])
+    if not vectors:
+        return
+    fresh = vectors[:len(clusters)]
+    prior = vectors[len(clusters):]
+
+    kept: list[tuple[dict, list[float]]] = []
+    rows: list[dict] = []
+    threshold = settings.EMBED_SIMILARITY
+
+    # clusters is in quality order, so the first copy of a story to be examined
+    # is the best one — the same rule the lexical passes elect winners by.
+    for article, vector, row in zip(clusters, fresh, result.rows):
+        match = _nearest(article, vector, zip(stored, prior), threshold)
+        if match is not None:
+            # Same story as something already stored: keep the stored row and
+            # top it up, exactly as the lexical already-stored path does.
+            enrichment = _enrichment(match, article)
+            if enrichment:
+                result.enrichments[match["id"]] = {
+                    **result.enrichments.get(match["id"], {}), **enrichment
+                }
+            result.count("semantic_duplicate")
+            continue
+
+        if _nearest(article, vector, kept, threshold) is not None:
+            result.count("semantic_duplicate")
+            continue
+
+        kept.append((article, vector))
+        rows.append(row)
+
+    result.rows[:] = rows
+
+
+def _nearest(article: dict, vector: list[float], pool, threshold: float) -> dict | None:
+    """The first article in `pool` inside the window and above the threshold."""
+    for other, other_vector in pool:
+        when_a, when_b = article.get("_when"), other.get("_when")
+        if when_a and when_b and abs(when_a - when_b) > _CLUSTER_WINDOW:
+            continue
+        if embeddings.cosine(vector, other_vector) >= threshold:
+            return other
+    return None
+
+
+def _embed_text(article: dict) -> str:
+    """Title plus whatever context there is.
+
+    A headline alone is a thin thing to embed — 'Chipmaker tops estimates' has
+    about eight informative words. The description roughly doubles that. Bodies
+    would be better again, but they are extracted after storage, so at cluster
+    time this is the most text there is.
+    """
+    title = article.get("title") or ""
+    description = article.get("description") or ""
+    return f"{title}. {description}".strip() if description else title
 
 
 def _find(pool: list[dict], article: dict) -> dict | None:

@@ -102,6 +102,10 @@ def days_ago_iso(days: int) -> str:
     return to_iso(now_utc() - timedelta(days=days))
 
 
+def hours_ago_iso(hours: int) -> str:
+    return to_iso(now_utc() - timedelta(hours=hours))
+
+
 def day_str(dt: datetime | date | None = None) -> str:
     """YYYY-MM-DD in UTC."""
     if dt is None:

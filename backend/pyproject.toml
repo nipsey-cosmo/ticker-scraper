@@ -31,6 +31,11 @@ dependencies = [
     # `binary` ships libpq so there is no C toolchain or PATH hunt on Windows;
     # `pool` because a Postgres connect is a round trip, unlike opening a file.
     "psycopg[binary,pool] (>=3.3.4,<4.0.0)",
+    # A browser TLS fingerprint for the hosts that refuse OpenSSL's at the
+    # handshake (stooq, accessnewswire). Off unless STOCKY_SCRAPE_IMPERSONATE
+    # is set, but a required install rather than an extra: it is a few MB, and
+    # an extra nobody installs is a fallback chain that stays broken.
+    "curl-cffi (>=0.13.0,<0.14.0)",
     "openai (>=2.30.0,<3.0.0)",
     # Windows ships no IANA database, so zoneinfo needs this to convert
     # Finviz's US-market timestamps.
@@ -44,6 +49,12 @@ finbert = [
     "transformers (>=5.4.0,<6.0.0)",
     "torch (>=2.11.0,<3.0.0)",
     "accelerate (>=1.13.0,<2.0.0)",
+]
+# The semantic dedup pass (services/embeddings.py). Opt-in for the same reason
+# FinBERT is: it pulls torch. Without it the two lexical dedup passes carry on
+# unchanged and the third simply does not run.
+semantic = [
+    "sentence-transformers (>=5.1.2,<6.0.0)",
 ]
 
 [build-system]

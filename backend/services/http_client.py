@@ -20,6 +20,12 @@ How it pushes throughput without getting blocked:
   only when a host starts pushing back.
 * **Connection reuse** (keep-alive), so many requests share one negotiated
   connection instead of re-handshaking. HTTP/1.1 only — see `http2=False`.
+* **A swappable transport.** httpx negotiates TLS through OpenSSL, and that
+  ClientHello has been in anti-bot fingerprint databases since 2017 — a host
+  behind Cloudflare Bot Management can refuse at the handshake, before a
+  single header is read. `STOCKY_SCRAPE_IMPERSONATE=chrome` swaps in curl_cffi,
+  which presents a real Chrome fingerprint. Everything above it is untouched:
+  same buckets, same breaker, same cache.
 * **Short-lived response cache**, so several scrapers wanting the same feed in
   one refresh cost one request.
 * **Conditional GET.** An entry outlives its own freshness so its `ETag` /
@@ -33,7 +39,9 @@ How it pushes throughput without getting blocked:
 Deliberately not here: proxy rotation, CAPTCHA solving, or anything that
 defeats an access control rather than sharing a host's capacity fairly. Where a
 source pushes back, the answer is another source — hence the fallback chains in
-prices.py and news/.
+prices.py and news/. The impersonating transport is on the right side of that
+line: it changes how we introduce ourselves, not how hard we push, and every
+rate limit above still applies to it unchanged.
 """
 from __future__ import annotations
 
@@ -176,6 +184,65 @@ class _HostState:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+class _Impersonator:
+    """curl_cffi wearing httpx's `Client` surface.
+
+    Only three things are needed of a client here — `get(url, params, headers)`,
+    a response with `.status_code/.text/.content/.headers/.url`, and `close()` —
+    and curl_cffi already provides all of them under slightly different names.
+    So this is a name adapter, not an abstraction: there is no second
+    implementation coming, and the day httpx grows TLS impersonation this whole
+    class goes away.
+
+    **One session per thread**, which is the part that matters. `Scraper` is
+    shared across the price and news thread pools, and a libcurl handle is not
+    safe to drive from two threads at once. Thread-local sessions keep
+    per-thread keep-alive without that risk.
+
+    HTTP/2 is real here, unlike on httpx: libcurl's implementation has no
+    equivalent of the hpack dynamic-table race that forced `http2=False` below,
+    because each thread owns its connection outright.
+    """
+
+    def __init__(self, target: str, timeout: float):
+        self._target = target
+        self._timeout = timeout
+        self._local = threading.local()
+        self._sessions: list = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def errors() -> tuple:
+        from curl_cffi.requests import errors
+        return (errors.RequestsError,)
+
+    def _session(self):
+        session = getattr(self._local, "session", None)
+        if session is None:
+            from curl_cffi import requests as curl_requests
+            session = curl_requests.Session(impersonate=self._target)
+            self._local.session = session
+            with self._lock:
+                self._sessions.append(session)
+        return session
+
+    def get(self, url: str, params: dict | None = None,
+            headers: dict | None = None):
+        return self._session().get(
+            url, params=params, headers=headers,
+            timeout=self._timeout, allow_redirects=True,
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            sessions, self._sessions = self._sessions, []
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:      # a half-open handle must not fail shutdown
+                pass
+
+
 class Scraper:
     """Thread-safe. Construct one and share it (see the module-level `scraper`).
 
@@ -190,6 +257,7 @@ class Scraper:
         max_retries: int | None = None,
         cache_ttl: float | None = None,
         transport: httpx.BaseTransport | None = None,
+        impersonate: str | None = None,
         clock=time.monotonic,
         sleep=time.sleep,
     ):
@@ -202,7 +270,26 @@ class Scraper:
         self._hosts_lock = threading.Lock()
         self._cache: dict[str, tuple[float, Fetched]] = {}
         self._cache_lock = threading.Lock()
-        self._client = httpx.Client(
+        self._client, self._errors = self._build_client(transport, impersonate)
+
+    def _build_client(self, transport, impersonate: str | None):
+        """(client, exception types). httpx unless a TLS fingerprint is asked for.
+
+        An injected `transport` always wins: it is how the tests drive this
+        class, and an httpx MockTransport has no meaning to libcurl.
+        """
+        target = settings.SCRAPE_IMPERSONATE if impersonate is None else impersonate
+        if target and transport is None:
+            try:
+                client = _Impersonator(target, self.timeout)
+                errors = _Impersonator.errors()
+                print(f"[scrape] impersonating {target} (curl_cffi transport)")
+                return client, errors
+            except ImportError:
+                print("[scrape] curl_cffi not installed, staying on httpx "
+                      "(poetry install --extras impersonate)")
+
+        return httpx.Client(
             # HTTP/1.1 only. Under threads h2 multiplexes every request onto one
             # connection whose hpack dynamic table is a deque mutated without a
             # lock, which raises "deque mutated during iteration" mid-sweep. No
@@ -215,7 +302,7 @@ class Scraper:
             limits=httpx.Limits(max_connections=settings.SCRAPE_CONCURRENCY * 2,
                                 max_keepalive_connections=settings.SCRAPE_CONCURRENCY),
             transport=transport,
-        )
+        ), (httpx.HTTPError,)
 
     # ── public ───────────────────────────────────────────────────────────
 
@@ -248,7 +335,7 @@ class Scraper:
                     url, params=params,
                     headers=self._headers(state, headers, conditional),
                 )
-            except httpx.HTTPError as exc:
+            except self._errors as exc:
                 self._on_failure(state)
                 if attempt == attempts - 1:
                     print(f"[scrape] {host} gave up after {attempts}: {type(exc).__name__}")
@@ -283,7 +370,9 @@ class Scraper:
             # A 404 is a real answer, not evidence we can go faster. Letting it
             # count made miss-heavy traffic (symbols.resolve tries up to four
             # candidates by design) probe every host up to its ceiling.
-            self._on_success(state, probe=response.is_success)
+            # `is_success` on httpx, `ok` on curl_cffi — ask the status
+            # directly and neither name has to be true.
+            self._on_success(state, probe=200 <= response.status_code < 300)
             fetched = Fetched(
                 url=str(response.url),
                 status=response.status_code,

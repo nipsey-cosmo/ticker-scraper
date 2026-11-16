@@ -158,6 +158,20 @@ def sources(symbols: str | None = Query(None), days: int = Query(14, ge=1, le=90
     return {"results": db.news.source_breakdown(wanted, since=days_ago_iso(days))}
 
 
+# Above /{news_id} for the same reason /trending and /latest are: a literal
+# segment declared after a path parameter never matches.
+@router.get("/story/{story_id}", response_model=NewsList)
+def story(story_id: UUID):
+    """Every stock's copy of one story, oldest first.
+
+    Dedup keeps a supplier story once per holding it touches, which is correct
+    — each is that stock's news — but leaves nothing saying they are the same
+    development. This is that link, and an empty list is a real answer: a
+    story_id only exists once a story spans more than one stock.
+    """
+    return NewsList(results=[to_news(row) for row in db.news.get_story(story_id)])
+
+
 @router.get("/{news_id}", response_model=NewsArticle)
 def article(news_id: UUID):
     row = db.news.get_news_by_id(news_id)

@@ -6,10 +6,12 @@ returning an empty feed in production.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from services.news import (extract, finviz, google_news, images, publishers,
-                          wires, yahoo_news)
+                          rns, wires, yahoo_news)
 
 GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -531,3 +533,210 @@ class TestBodyReachesTheEventPrompt:
         already took about a minute."""
         from services import events
         assert events._BATCH_SIZE <= 40
+
+
+# ── RNS: UK regulatory announcements (3.6) ───────────────────────────────
+
+# Synthetic, not captured. Investegate's terms cover their content, and this
+# repo is public — so the fixture reproduces the *shape* of the listing (the
+# permalink structure and the relative timestamp) without carrying anybody's
+# announcements. The live check that the real page still has this shape is
+# `test_live_sources.py`, which is opt-in.
+RNS_INDEX = """
+<html><body>
+<ul class="announcements">
+  <li>
+    <span>1 hour ago</span>
+    <a href="https://www.investegate.co.uk/announcement/rns/example-mining-plc--exm/half-year-results/9000001">Half Year Results</a>
+  </li>
+  <li>
+    <span>23 minutes ago</span>
+    <a href="https://www.investegate.co.uk/announcement/rns/example-mining-plc--exm/director-shareholding/9000002">Director/PDMR Shareholding</a>
+  </li>
+  <li>
+    <span>2 days ago</span>
+    <a href="https://www.investegate.co.uk/announcement/rns/northern-widget-group--nwg/trading-statement/9000003">Trading Statement</a>
+  </li>
+  <li>
+    <span>3 hours ago</span>
+    <a href="https://www.investegate.co.uk/announcement/rns/unlisted-holdings-ltd/scheme-of-arrangement/9000004">Scheme of Arrangement</a>
+  </li>
+  <!-- The same announcement linked twice, as listings do. -->
+  <li>
+    <span>1 hour ago</span>
+    <a href="https://www.investegate.co.uk/announcement/rns/example-mining-plc--exm/half-year-results/9000001">Half Year Results</a>
+  </li>
+  <li><a href="https://www.investegate.co.uk/about">About us</a></li>
+</ul>
+</body></html>
+"""
+
+
+class TestRnsParsing:
+    """Parses the links, not the layout. The announcement permalink is
+    self-describing — company slug, ticker, headline slug, id — so a listing
+    redesign moves the rows around without changing what they point at."""
+
+    def test_it_reads_company_and_ticker_out_of_the_permalink(self):
+        articles = rns.parse(RNS_INDEX)
+        first = articles[0]
+
+        assert first["title"] == "Example Mining Plc (EXM): Half Year Results"
+        assert first["source_type"] == "RNS"
+        assert first["source_domain"] == "investegate.co.uk"
+
+    def test_the_company_is_named_so_the_relevance_filter_keeps_it(self):
+        """A filing's own headline is "Half Year Results" — no company, no
+        ticker. Stored as-is every relevance check would drop it and every
+        dedup key would collide with every other issuer's results. Same problem
+        EDGAR has, same fix."""
+        from services import dedup
+
+        article = rns.parse(RNS_INDEX)[0]
+        assert dedup.is_relevant(article["title"], "EXM", "Example Mining plc")
+
+    def test_an_issuer_without_a_ticker_still_parses(self):
+        titles = [a["title"] for a in rns.parse(RNS_INDEX)]
+        assert "Unlisted Holdings Ltd: Scheme of Arrangement" in titles
+
+    def test_the_same_announcement_linked_twice_is_stored_once(self):
+        ids = [a["url"].rsplit("/", 1)[-1] for a in rns.parse(RNS_INDEX)]
+        assert len(ids) == len(set(ids))
+
+    def test_navigation_links_are_not_announcements(self):
+        assert not any("About us" in a["title"] for a in rns.parse(RNS_INDEX))
+
+    def test_relative_ages_are_resolved_against_now(self):
+        """The listing states age, not time."""
+        from normalize import now_utc
+
+        by_title = {a["title"]: a for a in rns.parse(RNS_INDEX)}
+        now = now_utc()
+
+        an_hour = by_title["Example Mining Plc (EXM): Half Year Results"]
+        two_days = by_title["Northern Widget Group (NWG): Trading Statement"]
+
+        assert 0.9 < (now - an_hour["published_at"]).total_seconds() / 3600 < 1.1
+        assert 1.9 < (now - two_days["published_at"]).days + 0.05 < 2.1
+
+    def test_a_missing_age_becomes_now_rather_than_the_epoch(self):
+        """None would sort the row to 1970 and bury a live announcement."""
+        from normalize import now_utc
+
+        html = ('<li><a href="https://www.investegate.co.uk/announcement/rns/'
+                'example-mining-plc--exm/half-year-results/9000001">Results</a></li>')
+        article = rns.parse(html)[0]
+
+        assert (now_utc() - article["published_at"]).total_seconds() < 60
+
+    def test_an_empty_page_is_empty_not_an_exception(self):
+        assert rns.parse("<html><body>nothing here</body></html>") == []
+        assert rns.parse("") == []
+
+
+class TestRnsGating:
+    """RNS is EDGAR's opposite number, so it is gated on the same test,
+    inverted. A New York listing files with the SEC, not the LSE."""
+
+    @staticmethod
+    def _quiet(monkeypatch):
+        from services import news as news_pkg
+
+        for module, names in (
+            (news_pkg.google_news, ("fetch_recent", "fetch_backfill")),
+            (news_pkg.yahoo_news, ("fetch_search", "fetch_rss")),
+            (news_pkg.bing_news, ("fetch",)),
+            (news_pkg.finviz, ("fetch",)),
+            (news_pkg.nasdaq_news, ("fetch",)),
+            (news_pkg.sec_edgar, ("fetch", "full_text")),
+            (news_pkg.wires, ("for_stock",)),
+            (news_pkg.rns, ("for_stock",)),
+        ):
+            for name in names:
+                monkeypatch.setattr(module, name, lambda *a, **kw: [])
+
+    def test_a_us_listing_records_rns_as_skipped(self, temp_db, monkeypatch):
+        """Skipped, not failed. A dead source and a source that was never
+        asked look identical in the yield table otherwise."""
+        import db
+        from services import news as news_pkg
+
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+
+        news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS")
+
+        row = {r["source_type"]: r for r in db.sources.yields()}["RNS"]
+        assert row["skips"] == 1 and row["fetches"] == 0
+
+    def test_a_london_listing_asks_rns(self, temp_db, monkeypatch):
+        import db
+        from services import news as news_pkg
+
+        self._quiet(monkeypatch)
+
+        news_pkg.collect("SHEL", "Shell plc", "SHEL.L", "LSE")
+
+        row = {r["source_type"]: r for r in db.sources.yields()}["RNS"]
+        assert row["fetches"] == 1 and row["skips"] == 0
+
+    def test_a_us_listing_never_reaches_the_network(self, temp_db, monkeypatch):
+        """The gate has to be above the fetch, not inside the parser."""
+        from services import news as news_pkg
+
+        called = []
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.settings, "sec_enabled", lambda: True)
+        monkeypatch.setattr(news_pkg.rns, "for_stock",
+                            lambda *a, **kw: called.append(1) or [])
+
+        news_pkg.collect("AAPL", "Apple Inc.", "AAPL", "NMS")
+
+        assert called == []
+
+
+class TestRnsFirehose:
+    """One index page carries every issuer, so it is fetched once per cycle and
+    shared — the same arrangement the wires use, for the same reason."""
+
+    @staticmethod
+    def _serving(html, calls):
+        def get(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(ok=True, text=html)
+        return get
+
+    def test_the_index_is_fetched_once_and_shared(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(rns, "_cache", None)
+        monkeypatch.setattr(rns.scraper, "get", self._serving(RNS_INDEX, calls))
+
+        rns.for_stock("EXM", "Example Mining plc")
+        rns.for_stock("NWG", "Northern Widget Group")
+
+        assert len(calls) == 1
+
+    def test_the_firehose_is_narrowed_to_the_stock(self, monkeypatch):
+        """Not left to dedup: a few hundred announcements counted as "found for
+        this stock" would make the per-source yield meaningless."""
+        monkeypatch.setattr(rns, "_cache", None)
+        monkeypatch.setattr(rns.scraper, "get", self._serving(RNS_INDEX, []))
+
+        mine = rns.for_stock("EXM", "Example Mining plc")
+
+        assert mine and all("Example Mining" in a["title"] for a in mine)
+
+    def test_an_empty_cycle_is_cached_too(self, monkeypatch):
+        """An index that just failed will not answer better for stock twenty."""
+        calls = []
+        monkeypatch.setattr(rns, "_cache", None)
+
+        def failing(*args, **kwargs):
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(rns.scraper, "get", failing)
+
+        assert rns.for_stock("EXM", "Example Mining plc") == []
+        assert rns.for_stock("NWG", "Northern Widget Group") == []
+        assert len(calls) == 1

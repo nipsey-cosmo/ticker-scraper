@@ -11,7 +11,7 @@ import time
 import db
 import settings
 from normalize import days_ago_iso, markets_open
-from services import calendar, news, prices, sentiment_service, social
+from services import calendar, events, news, prices, sentiment_service, social
 
 # One backfill per symbol at a time. Adding a stock twice in quick succession
 # would otherwise fan out two identical month-long scrapes.
@@ -20,6 +20,10 @@ _backfill_lock = threading.Lock()
 
 # Monotonic stamp of the last refresh that actually ran, for the slow cadence.
 _last_price_refresh = 0.0
+
+# A fortnight of 5m bars. Long enough that every event reaches its attribution
+# window with bars still on disk, short enough that the table stays small.
+INTRADAY_RETENTION_DAYS = 14
 
 
 # ── Scheduled ────────────────────────────────────────────────────────────
@@ -39,6 +43,18 @@ def refresh_prices() -> dict:
 
     _last_price_refresh = now
     return prices.refresh_watchlist(range_="5d")
+
+
+def refresh_intraday() -> dict:
+    """Fast cadence. 5m bars while a market is open, then attribution.
+
+    The two belong in one job: attribution reads exactly the bars the pull just
+    stored, and running it anywhere else would measure yesterday's window with
+    today's data missing. It is pure SQL, so it costs nothing on the ticks where
+    the market is shut and the pull returns immediately.
+    """
+    stored = prices.refresh_watchlist_intraday()
+    return {**stored, "attributed": events.attribute_pending()}
 
 
 def refresh_news() -> dict:
@@ -86,10 +102,16 @@ def prune() -> dict:
     """Daily. Keep the DB bounded."""
     articles = news.prune()
     points = db.prices.delete_older_than(days_ago_iso(400))
+    # 5m bars get their own far shorter window. At ~78 rows per stock per
+    # trading day they would be the largest table in the database inside a
+    # month, and nothing reads them once an event is past attributing.
+    intraday = db.prices.delete_older_than(
+        days_ago_iso(INTRADAY_RETENTION_DAYS), interval=db.prices.INTRADAY)
     # /health only ever asks for the last week of yields; a year of daily rows
     # per source is already generous for looking back at when a source died.
     yields = db.sources.delete_older_than(days_ago_iso(365)[:10])
-    return {"articles": articles, "price_points": points, "source_yields": yields}
+    return {"articles": articles, "price_points": points,
+            "intraday_points": intraday, "source_yields": yields}
 
 
 # ── On demand ────────────────────────────────────────────────────────────
@@ -145,6 +167,7 @@ def refresh_all() -> dict:
     """Manual full refresh, exposed on POST /refresh."""
     return {
         "prices": refresh_prices(),
+        "intraday": refresh_intraday(),
         "news": refresh_news(),
         "sentiment_days": aggregate_sentiment(),
         "earnings": refresh_earnings(),

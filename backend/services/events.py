@@ -34,8 +34,11 @@ from . import ai_service, calendar
 
 # Impact is a coarse tier on purpose. A confidence score or a "≈4% of quarterly
 # revenue" materiality estimate would be fake precision: we have headlines, not
-# fundamentals, and scraped publish timestamps are unreliable enough that
-# market-reaction deltas can't be computed either.
+# fundamentals.
+#
+# The market reaction *is* computed, but as a window rather than a delta — see
+# `attribute_pending` below for why that distinction is the whole answer to the
+# unreliable-timestamp problem.
 IMPACTS = frozenset({"high", "medium", "low"})
 
 # An article no event claimed is, by definition, nothing materially new.
@@ -300,3 +303,92 @@ def _stronger(current: str | None, incoming: str) -> str:
     if current is None:
         return incoming
     return max(current, incoming, key=order.index)
+
+
+# ── Did it actually move? ────────────────────────────────────────────────
+
+# Two hours of trading, counted in 5m bars so an overnight gap is not mistaken
+# for a flat reaction. Long enough for a real reaction to play out, short enough
+# that the next piece of news is usually not the thing being measured.
+_MOVE_BARS = 24
+
+# How long after an event before its window is treated as closed. Comfortably
+# more than _MOVE_BARS of trading, because those two hours are trading hours: an
+# event at Friday's close does not finish its window until Monday morning.
+_MOVE_SETTLE_HOURS = 72
+
+# Intraday bars are pruned at a fortnight (jobs.prune), so an event older than
+# that can never be attributed. Matching the two is what lets a failed
+# attribution simply age out instead of needing a "we tried" column.
+_MOVE_MAX_AGE_DAYS = 14
+
+
+def attribute_pending() -> int:
+    """Measure what the stock did after each event nobody has measured yet.
+
+    This is the question `impact` cannot answer. The LLM says a development is
+    material; this says whether anyone trading agreed. They disagree often, and
+    the disagreement is the interesting part.
+
+    Deliberately a *window*, not a delta. Scraped publish timestamps are good to
+    about the hour, which is why no instant-to-instant reaction is computed
+    anywhere here: the answer is "over the two trading hours from the bar the
+    story landed in", both ends are stored, and nothing downstream should read
+    more precision into it than that.
+
+    Runs after the intraday pull rather than at insert time, because at insert
+    time the bars being measured have not happened yet.
+    """
+    pending = db.events.needing_attribution(_MOVE_SETTLE_HOURS, _MOVE_MAX_AGE_DAYS)
+    attributed = 0
+
+    for event in pending:
+        if not event["first_seen"]:
+            continue                      # backing articles gone, nothing to anchor to
+        move = measure(event["short_name"], event["first_seen"])
+        if not move:
+            continue                      # no intraday cover for that window
+        db.events.set_move(event["id"], move["from_ts"], move["to_ts"],
+                           move["percent"], move["volume_x"])
+        attributed += 1
+
+    if attributed:
+        print(f"[events] attributed {attributed} of {len(pending)} pending event(s)")
+    return attributed
+
+
+def measure(short_name: str, since: str) -> dict | None:
+    """The move over the trading window that follows `since`, or None.
+
+    None whenever the window cannot be honestly measured — no bars, only one
+    bar, or a zero base price — rather than a 0.0 that would read as "the market
+    shrugged".
+    """
+    bars = db.prices.window_from(short_name, since, _MOVE_BARS + 1)
+    if len(bars) < 2:
+        return None
+
+    base, end = bars[0], bars[-1]
+    if not base["close"]:
+        return None
+
+    return {
+        "from_ts": base["ts"],
+        "to_ts": end["ts"],
+        "percent": round((end["close"] - base["close"]) / base["close"] * 100, 3),
+        "volume_x": _volume_ratio(short_name, bars[1:]),
+    }
+
+
+def _volume_ratio(short_name: str, bars: list[dict]) -> float | None:
+    """How busy the window was against a median bar for this stock.
+
+    A 2% move on ordinary volume and a 2% move on five times the usual are
+    different events, and the percentage alone cannot tell them apart. None when
+    there is nothing to compare against — an unknown ratio, not a ratio of 1.
+    """
+    volumes = [b["volume"] for b in bars if b["volume"]]
+    typical = db.prices.typical_intraday_volume(short_name)
+    if not volumes or not typical:
+        return None
+    return round((sum(volumes) / len(volumes)) / typical, 2)

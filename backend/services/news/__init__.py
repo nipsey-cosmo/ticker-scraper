@@ -4,6 +4,8 @@ Seven fetches across five independent operators, so no single company's outage
 or rate limit can take the feed down:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
+    EDGAR search  filings by *other* companies that name this one (US, opt-in)
+    RNS           UK regulatory announcements — EDGAR's opposite number (non-US)
     Newswires     the company's own release, which every article rewrites
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
@@ -40,7 +42,7 @@ from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
 from . import (bing_news, extract, finviz, google_news, images, nasdaq_news,
-               sec_edgar, wires, yahoo_news)
+               rns, sec_edgar, wires, yahoo_news)
 
 __all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
            "FAST_SOURCES"]
@@ -95,12 +97,27 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
         # instead.
         if settings.sec_enabled():
             tasks.append((sec_edgar.SOURCE_TYPE,
-                          lambda: sec_edgar.fetch(us_ticker, company_name)))
+                          lambda: sec_edgar.fetch(us_ticker, company_name,
+                                                  short_name=short_name)))
+            # Deliberately not in FAST_SOURCES. A filing naming somebody else's
+            # supplier is not a minutes-matter event, and the full-text index
+            # is a heavier query than a submissions lookup, so it rides the
+            # hourly lane only.
+            tasks.append((sec_edgar.FULLTEXT_TYPE,
+                          lambda: sec_edgar.full_text(us_ticker, company_name,
+                                                      days=days)))
         else:
-            skipped.add(sec_edgar.SOURCE_TYPE)
+            skipped.update({sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
+        skipped.add(rns.SOURCE_TYPE)
     else:
+        # RNS is EDGAR's opposite number, so it is gated the same way and on
+        # the same test — inverted. A New York listing files with the SEC, not
+        # the LSE, and asking for its RNS announcements is asking for nothing.
+        tasks.append((rns.SOURCE_TYPE,
+                      lambda: rns.for_stock(short_name, company_name,
+                                            _alias_tuple(yahoo_symbol))))
         skipped.update({finviz.SOURCE_TYPE, nasdaq_news.SOURCE_TYPE,
-                        sec_edgar.SOURCE_TYPE})
+                        sec_edgar.SOURCE_TYPE, sec_edgar.FULLTEXT_TYPE})
 
     if only is not None:
         tasks = [task for task in tasks if task[0] in only]
@@ -242,6 +259,15 @@ def refresh_watchlist(days: int = 2, only: frozenset[str] | None = None,
                                       detect_events=detect_events)["inserted"]
         except Exception as exc:
             print(f"[news] {short_name} failed: {type(exc).__name__}: {exc}")
+
+    # After every stock, never per stock: a cross-stock link needs the other
+    # stocks' rows to already be there, so linking inside the loop would only
+    # ever connect the tickers that happened to refresh first. Cheap enough to
+    # run on the fast lane too — a filing naming two of your holdings is
+    # exactly the story worth connecting the minute it lands.
+    linked = db.news.link_stories()
+    if linked:
+        print(f"[news] linked {linked} row(s) into cross-stock stories")
 
     # Both cost a fetch per article and a filing carries no image, so the
     # fast lane stores and moves on. Pruning is a daily concern either way.

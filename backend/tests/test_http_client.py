@@ -8,7 +8,14 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from services.http_client import _DEFAULT_RATE, Scraper, _host_of, _retry_after
+import settings
+from services.http_client import (
+    _DEFAULT_RATE,
+    Scraper,
+    _host_of,
+    _Impersonator,
+    _retry_after,
+)
 
 
 class FakeClock:
@@ -515,3 +522,247 @@ class TestHeadersAndStats:
         stats = {s["host"]: s for s in scraper.stats()}
         assert stats["example.com"]["requests"] == 1
         assert stats["example.com"]["circuit_open"] is False
+
+
+# ── The impersonating transport (3.4) ────────────────────────────────────
+
+class FakeCurlResponse:
+    """A curl_cffi response: `ok`, not httpx's `is_success`."""
+
+    def __init__(self, status, text="", headers=None, url="https://example.com/a"):
+        self.status_code = status
+        self.text = text
+        self.content = text.encode()
+        self.headers = headers or {}
+        self.url = url
+        self.ok = 200 <= status < 300
+
+
+class FakeCurlError(Exception):
+    """Stands in for curl_cffi.requests.errors.RequestsError, which is not an
+    httpx.HTTPError — the exact reason the except clause had to stop naming a
+    library."""
+
+
+class FakeCurlClient:
+    """A curl_cffi-shaped client with no httpx anywhere in the call path."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.closed = False
+
+    def get(self, url, params=None, headers=None, **kwargs):
+        self.seen = {"url": url, "params": params, "headers": headers}
+        return self._handler(url)
+
+    def close(self):
+        self.closed = True
+
+
+def make_curl_scraper(handler, clock=None, **kwargs) -> Scraper:
+    """The same Scraper, driven through a curl-shaped client."""
+    clock = clock or FakeClock()
+    scraper = Scraper(
+        clock=clock, sleep=kwargs.pop("sleep", clock.sleep),
+        max_retries=kwargs.pop("max_retries", 2),
+        cache_ttl=kwargs.pop("cache_ttl", 300.0),
+        **kwargs,
+    )
+    scraper._client.close()                 # drop the real httpx client
+    scraper._client = FakeCurlClient(handler)
+    scraper._errors = (FakeCurlError,)
+    scraper._clock_obj = clock
+    return scraper
+
+
+@pytest.fixture(params=["httpx", "curl_cffi"])
+def transport(request):
+    """Builds a Scraper on either transport from one shared response plan.
+
+    `plan` is a zero-argument callable returning `(status, text)`, or raising
+    `build.transport_error` to simulate the connection dying. The point of the
+    fixture is that every limiter assertion below is written once and asserted
+    against both.
+    """
+    def build(plan, **kwargs):
+        if request.param == "httpx":
+            def handler(_request):
+                status, text = plan()
+                return httpx.Response(status, text=text)
+            return make_scraper(handler, **kwargs)
+
+        def handler(_url):
+            status, text = plan()
+            return FakeCurlResponse(status, text)
+        return make_curl_scraper(handler, **kwargs)
+
+    build.name = request.param
+    build.transport_error = (httpx.ConnectError("boom") if request.param == "httpx"
+                             else FakeCurlError("boom"))
+    return build
+
+
+class TestTransportSelection:
+    """The flag picks the transport and nothing else. Every rate limit,
+    breaker and cache line above it is shared code either way."""
+
+    def test_the_default_is_httpx(self):
+        scraper = Scraper()
+        assert isinstance(scraper._client, httpx.Client)
+        assert scraper._errors == (httpx.HTTPError,)
+        scraper.close()
+
+    def test_the_flag_selects_curl_cffi(self):
+        scraper = Scraper(impersonate="chrome")
+        assert isinstance(scraper._client, _Impersonator)
+        assert httpx.HTTPError not in scraper._errors
+        scraper.close()
+
+    def test_the_setting_selects_it_too(self, monkeypatch):
+        monkeypatch.setattr(settings, "SCRAPE_IMPERSONATE", "chrome")
+        scraper = Scraper()
+        assert isinstance(scraper._client, _Impersonator)
+        scraper.close()
+
+    def test_an_injected_transport_still_wins(self, monkeypatch):
+        """An httpx MockTransport means nothing to libcurl, and it is how every
+        other test in this file drives the class."""
+        monkeypatch.setattr(settings, "SCRAPE_IMPERSONATE", "chrome")
+        scraper = make_scraper(ok)
+        assert isinstance(scraper._client, httpx.Client)
+        assert scraper.get("https://example.com/a").text == "hello"
+        scraper.close()
+
+    def test_sessions_are_per_thread(self):
+        """`Scraper` is shared across the price and news thread pools, and a
+        libcurl handle is not safe to drive from two threads at once."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        client = _Impersonator("chrome", timeout=5.0)
+        # A barrier, not just three tasks: a pool will happily serve all three
+        # from one worker, and then the test passes whatever the code does.
+        gate = threading.Barrier(3, timeout=10)
+
+        def grab(_):
+            gate.wait()
+            return id(client._session())
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            sessions = list(pool.map(grab, range(3)))
+
+        assert len(set(sessions)) == 3
+        assert id(client._session()) not in sessions      # and one for this thread
+        client.close()
+
+    def test_close_releases_every_session(self):
+        client = _Impersonator("chrome", timeout=5.0)
+        client._session()
+        assert client._sessions
+        client.close()
+        assert client._sessions == []
+
+    def test_a_missing_package_falls_back_rather_than_failing(self, monkeypatch, capsys):
+        """The flag being set on a machine without the wheel must degrade to
+        httpx, not take the whole scraper down."""
+        monkeypatch.setattr(_Impersonator, "errors", staticmethod(
+            lambda: (_ for _ in ()).throw(ImportError("no curl_cffi"))))
+
+        scraper = Scraper(impersonate="chrome")
+
+        assert isinstance(scraper._client, httpx.Client)
+        assert "staying on httpx" in capsys.readouterr().out
+        scraper.close()
+
+
+class TestLimiterIsTransportAgnostic:
+    """Both paths satisfy the same limiter tests — which is the whole claim
+    3.4 makes: this swaps the transport and nothing else."""
+
+    def test_a_successful_fetch_returns_the_body(self, transport):
+        scraper = transport(lambda: (200, "hello"))
+        assert scraper.get("https://example.com/a").text == "hello"
+
+    def test_a_429_halves_the_rate(self, transport):
+        scraper = transport(lambda: (429, ""), max_retries=0)
+        state = scraper._state("example.com")
+        before = state.rate
+
+        scraper.get("https://example.com/a")
+
+        assert state.rate == pytest.approx(before * 0.5)
+        assert state.throttled >= 1
+
+    def test_the_rate_is_probed_upward_on_clean_responses(self, transport):
+        scraper = transport(lambda: (200, "hello"))
+        state = scraper._state("example.com")
+        before = state.rate
+
+        for i in range(40):
+            scraper.get(f"https://example.com/{i}")
+
+        assert before < state.rate <= state.max_rate
+
+    def test_retries_are_bounded_then_give_up(self, transport):
+        attempts = []
+
+        def plan():
+            attempts.append(1)
+            return 503, ""
+
+        assert transport(plan, max_retries=2).get("https://example.com/a") is None
+        assert len(attempts) == 3          # initial + 2 retries
+
+    def test_a_transport_error_is_retried(self, transport):
+        """The reason `except httpx.HTTPError` had to go: curl_cffi's error is
+        not one, so the old clause would have let it escape the retry loop and
+        crash a refresh."""
+        attempts = []
+
+        def plan():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise transport.transport_error
+            return 200, "recovered"
+
+        result = transport(plan, max_retries=3).get("https://example.com/a")
+
+        assert result.text == "recovered"
+        assert len(attempts) == 3
+
+    def test_a_transport_error_eventually_gives_up_quietly(self, transport):
+        def plan():
+            raise transport.transport_error
+
+        assert transport(plan, max_retries=1).get("https://example.com/a") is None
+
+    def test_the_cache_serves_the_second_call(self, transport):
+        attempts = []
+
+        def plan():
+            attempts.append(1)
+            return 200, "cached"
+
+        scraper = transport(plan)
+        first = scraper.get("https://example.com/a")
+        second = scraper.get("https://example.com/a")
+
+        assert first.text == second.text == "cached"
+        assert len(attempts) == 1
+
+    def test_the_circuit_opens_after_repeated_failures(self, transport):
+        def plan():
+            raise transport.transport_error
+
+        scraper = transport(plan, max_retries=0)
+        for i in range(12):
+            scraper.get(f"https://example.com/{i}")
+
+        assert scraper._state("example.com").blocked_until > scraper._clock()
+
+    def test_stats_are_recorded_either_way(self, transport):
+        scraper = transport(lambda: (200, "hello"))
+        scraper.get("https://example.com/a")
+
+        stats = scraper.stats()
+        assert stats[0]["host"] == "example.com" and stats[0]["requests"] >= 1
