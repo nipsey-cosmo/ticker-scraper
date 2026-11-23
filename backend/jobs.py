@@ -18,8 +18,9 @@ from services import calendar, events, news, prices, sentiment_service, social
 _backfilling: set[str] = set()
 _backfill_lock = threading.Lock()
 
-# Monotonic stamp of the last refresh that actually ran, for the slow cadence.
-_last_price_refresh = 0.0
+# Monotonic stamp of the last full price pass, for the hourly cadence. Minus
+# infinity so the start-up call is always due.
+_last_price_refresh = float("-inf")
 
 # A fortnight of 5m bars. Long enough that every event reaches its attribution
 # window with bars still on disk, short enough that the table stays small.
@@ -31,18 +32,24 @@ INTRADAY_RETENTION_DAYS = 14
 def refresh_prices() -> dict:
     """Quote + recent bars for every followed stock.
 
-    The scheduler ticks on the fast cadence so an open market is never more
-    than a few minutes stale. Outside trading hours the price cannot move, so
-    most of those ticks return here immediately and only one an hour goes to
-    the network — near-live when it matters, and quiet when it doesn't.
+    The scheduler ticks on the fast cadence. Once an hour the tick is a full
+    pass over every stock, which is what brings daily bars, splits, dividends
+    and snapshots. In between, while a market is open, it refreshes only the
+    stocks whose quote has gone stale — the ones the price stream is not
+    feeding, or all of them if the stream is down — so an open market is never
+    more than a few minutes stale either way. Outside trading hours the price
+    cannot move, so those ticks return here immediately.
     """
     global _last_price_refresh
     now = time.monotonic()
-    if not markets_open() and now - _last_price_refresh < settings.PRICE_REFRESH_MINUTES * 60:
+    due = now - _last_price_refresh >= settings.PRICE_REFRESH_MINUTES * 60
+    if not due and not markets_open():
         return {"updated": [], "failed": [], "skipped": "markets closed"}
 
-    _last_price_refresh = now
-    return prices.refresh_watchlist(range_="5d")
+    if due:
+        _last_price_refresh = now
+        return prices.refresh_watchlist(range_="5d")
+    return prices.refresh_watchlist(range_="5d", stale_only=True)
 
 
 def refresh_intraday() -> dict:

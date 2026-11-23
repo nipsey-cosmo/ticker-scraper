@@ -4,8 +4,14 @@ These are the public JSON endpoints a browser hits, so no key and no crumb
 dance. The chart endpoint is the workhorse: one call returns the live quote
 *and* the historical series, which is why there is no separate bulk-quote path
 to keep working. Fewer code paths, more data per request.
+
+The one non-JSON payload is the price stream's tick (`parse_pricing`), which
+services/stream.py reads off Yahoo's WebSocket.
 """
 from __future__ import annotations
+
+import base64
+import struct
 
 from normalize import to_iso
 
@@ -67,6 +73,13 @@ def _try_hosts(hosts: list[str], path: str, params: dict, cache: bool = True) ->
 # Intervals fine enough that a cached response would be served as live.
 _INTRADAY = frozenset({"1m", "2m", "5m", "15m"})
 
+# Yahoo symbol -> minor-unit divisor, as last seen on a chart call. The price
+# stream carries no currency for equities, so this is the only place it can
+# learn that SHEL.L is quoted in pence; a symbol with no entry yet has simply
+# not been charted since start-up. Written by the job threads and read by the
+# stream thread — single key assignments, which the GIL keeps whole.
+minor_units: dict[str, float] = {}
+
 
 # ── Chart: quote + history in one request ────────────────────────────────
 
@@ -74,8 +87,8 @@ def chart(symbol: str, range_: str = "1mo", interval: str = "1d") -> dict | None
     """Parsed chart payload, or None.
 
     Returns:
-        {"symbol", "exchange", "currency", "price", "previous_close",
-         "change", "change_percent",
+        {"symbol", "exchange", "currency", "divisor", "price",
+         "previous_close", "change", "change_percent",
          "points": [{"ts", "close", "open", "high", "low", "volume"}]}
 
     Every field of a point except `ts` and `close` may be None: the feed has
@@ -89,7 +102,10 @@ def chart(symbol: str, range_: str = "1mo", interval: str = "1d") -> dict | None
     )
     if not data:
         return None
-    return parse_chart(data)
+    parsed = parse_chart(data)
+    if parsed:
+        minor_units[symbol] = parsed["divisor"]
+    return parsed
 
 
 def parse_chart(data: dict) -> dict | None:
@@ -162,6 +178,7 @@ def parse_chart(data: dict) -> dict | None:
         "exchange_name": meta.get("fullExchangeName"),
         "instrument_type": meta.get("instrumentType"),
         "currency": currency,
+        "divisor": divisor,
         "price": round(price, 6),
         "previous_close": round(previous, 6) if previous else None,
         "change": change,
@@ -255,6 +272,82 @@ def _shares(value) -> int | None:
 def _iso_from_epoch(seconds: int) -> str:
     from datetime import datetime, timezone
     return to_iso(datetime.fromtimestamp(seconds, timezone.utc))
+
+
+# ── Price stream: one protobuf tick ──────────────────────────────────────
+
+# Stream field numbers that are read; every other field is skipped by its wire
+# type, so a field Yahoo adds tomorrow costs nothing.
+_ID, _PRICE, _TIME, _MARKET_HOURS, _CHANGE_PERCENT, _CHANGE = 1, 2, 3, 7, 8, 12
+
+
+def parse_pricing(message_b64: str) -> dict | None:
+    """One stream tick: {"symbol", "price", "time", "market_hours", "change",
+    "change_percent"}, or None for anything malformed or truncated.
+
+    Hand-decoded rather than via the protobuf package: five fields of one
+    message do not justify a dependency and a generated module. The wire format
+    is proto3, which omits a field whose value is zero, so an absent number is
+    returned as 0 — that is what the sender meant. It matters most for
+    `market_hours`, where 0 is pre-market and only 1 is the regular session.
+
+    Prices are float32 on the wire. Rounding to seven significant digits — all
+    a float32 holds — turns 350.80999756 back into the 350.81 that was quoted.
+    """
+    try:
+        data = base64.b64decode(message_b64, validate=True)
+        fields: dict[int, int | bytes] = {}
+        pos = 0
+        while pos < len(data):
+            key, pos = _varint(data, pos)
+            wire = key & 7
+            if wire == 0:
+                value, pos = _varint(data, pos)
+            elif wire in (1, 2, 5):
+                if wire == 2:
+                    size, pos = _varint(data, pos)
+                else:
+                    size = 8 if wire == 1 else 4
+                value, pos = data[pos:pos + size], pos + size
+                if pos > len(data):
+                    return None                    # cut off mid-value
+            else:
+                return None                        # groups: not in this schema
+            fields[key >> 3] = value
+
+        symbol = fields[_ID].decode()
+        price = _float32(fields[_PRICE])
+        return {
+            "symbol": symbol,
+            "price": price,
+            "time": _zigzag(fields.get(_TIME, 0)),
+            "market_hours": fields.get(_MARKET_HOURS, 0),
+            "change": _float32(fields.get(_CHANGE, bytes(4))),
+            "change_percent": _float32(fields.get(_CHANGE_PERCENT, bytes(4))),
+        }
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError, struct.error):
+        return None
+
+
+def _varint(data: bytes, pos: int) -> tuple[int, int]:
+    """(value, next position). Raises IndexError if the bytes run out."""
+    value = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _zigzag(n: int) -> int:
+    """sint64 decoding: 0, -1, 1, -2 ... are sent as 0, 1, 2, 3 ..."""
+    return (n >> 1) ^ -(n & 1)
+
+
+def _float32(raw: bytes) -> float:
+    return float(f"{struct.unpack('<f', raw)[0]:.7g}")
 
 
 # ── Search: symbol resolution + a news side-channel ──────────────────────

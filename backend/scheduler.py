@@ -5,17 +5,20 @@ request, and so restarting the API doesn't interrupt a refresh.
 """
 from __future__ import annotations
 
+import threading
+
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 import db
 import jobs
 import settings
+from services import stream
 
 scheduler = BlockingScheduler(timezone="UTC")
 
-# Prices on the fast cadence. `jobs.refresh_prices` drops most of these ticks
-# back to the hourly interval once every market is shut, so this buys a price
-# that is minutes old during the session without scraping all night.
+# Prices on the fast cadence. `jobs.refresh_prices` makes one tick an hour a
+# full pass; the rest poll only stocks the price stream (started in main) is
+# not keeping fresh, and do nothing at all once every market is shut.
 scheduler.add_job(
     jobs.refresh_prices, "interval",
     minutes=settings.PRICE_REFRESH_OPEN_MINUTES, id="prices",
@@ -65,9 +68,11 @@ scheduler.add_job(
 
 def main() -> None:
     db.create_tables()
-    print(f"[scheduler] prices every {settings.PRICE_REFRESH_OPEN_MINUTES}m while a market "
-          f"is open ({settings.PRICE_REFRESH_MINUTES}m otherwise), "
-          f"news every {settings.NEWS_REFRESH_MINUTES}m "
+    print(f"[scheduler] live quotes from the Yahoo stream, flushed every "
+          f"{stream.FLUSH_SECONDS}s; prices polled every "
+          f"{settings.PRICE_REFRESH_OPEN_MINUTES}m while a market is open for "
+          f"stocks the stream is not feeding, full pass every "
+          f"{settings.PRICE_REFRESH_MINUTES}m; news every {settings.NEWS_REFRESH_MINUTES}m "
           f"(filings every {settings.NEWS_FAST_MINUTES}m)")
 
     # Bring everything current on start rather than idling until the first tick.
@@ -78,6 +83,12 @@ def main() -> None:
     jobs.aggregate_sentiment()
     jobs.refresh_earnings()
     jobs.refresh_social()
+
+    # After the start-up price pass, so every followed symbol has been charted
+    # and yahoo.minor_units knows its divisor: the stream drops a tick it
+    # cannot scale rather than guess. Daemon, so Ctrl+C is not held up by a
+    # socket waiting on its next tick.
+    threading.Thread(target=stream.run, name="stream", daemon=True).start()
 
     try:
         scheduler.start()

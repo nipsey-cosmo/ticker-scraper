@@ -167,9 +167,44 @@ source agrees with.
 History comes from Yahoo only. If Yahoo is unavailable the quote still updates
 from a fallback and stored history stops extending: degraded, not broken.
 
-The scheduler ticks every five minutes but `jobs.refresh_prices` drops most of
-those back to hourly once every market is shut. A closed market's price cannot
-move, so polling it is load on someone else's servers for an unchanged number.
+**Live quotes come from Yahoo's WebSocket price stream**, above the chain rather
+than in it (`services/stream.py`). One long-lived connection in the scheduler
+process subscribes to every followed stock, keeps the latest regular-session
+tick per symbol, and writes them all in one statement every five seconds. It
+writes only the quote row: no snapshots, no bars. The ticks are protobuf,
+decoded by hand in `yahoo.parse_pricing` rather than pulling in the protobuf
+package for five fields. A follow or unfollow reaches the stream within 15
+seconds, which is how often it re-reads the watchlist and re-subscribes.
+
+The poll stays as the fallback, through the database rather than any signal
+from the stream. The scheduler ticks every five minutes; once an hour the tick
+is a full pass over every stock (daily bars, splits, dividends, snapshots), and
+in between it refreshes only stocks whose quote is more than two minutes old. A
+dead or mute stream therefore needs no detection: its quotes age and the
+five-minute poll takes them back. Once every market is shut the in-between
+ticks do nothing at all, since a closed market's price cannot move.
+
+Ticks are dropped rather than stored when they are extended-hours (only an
+explicit regular-session flag counts, the same rule as Nasdaq's
+`secondaryData` above), or when the symbol's minor-unit divisor is not known
+to be 1. The stream carries no currency for equities, so the divisor comes from
+the last chart call; a London line in pence stays on the poll until the
+stream's unit for it has been checked during London hours.
+
+What the stream costs, honestly:
+
+- Each five-second write fires the `stocks` change notification, so open
+  browser tabs re-fetch every five seconds during a session where they did
+  every five minutes. `stream.FLUSH_SECONDS` is the knob.
+- Today's daily bar lags up to an hour for a streamed stock, since only the
+  hourly pass writes bars for it.
+- A newly followed stock waits for its first chart call (up to five minutes)
+  to learn its divisor before it streams.
+- The 5m intraday job is untouched, so Yahoo requests per stock-hour fall from
+  24 to about 13, not to 1.
+- Not yet verified: that pre-market ticks arrive with the session flag absent,
+  that the connection holds for hours, any cap on symbols per connection, and
+  that every exchange streams. One that does not stays on the poll.
 
 ## The instrument catalogue
 
@@ -399,7 +434,7 @@ normalize.py    pure date/URL/title helpers, no I/O
 db/             one module per table; connection.py owns the schema,
                 flags.py owns the runtime feature flags
 routes/         stocks, news, watchlist, insights, system
-services/       http_client (the shared scraper), symbols, prices, dedup,
+services/       http_client (the shared scraper), symbols, prices, stream, dedup,
                 sentiment_service, ai_service, events, news/ (one per source)
 tests/          548 tests, no network
 ```
@@ -441,7 +476,7 @@ Everything has a working default. No key is required.
 | `STOCKY_CORS_ORIGINS` | localhost 3000/4173/5173/8080 | Allow-list |
 | `STOCKY_BACKFILL_DAYS` | `30` | History pulled for a new follow |
 | `STOCKY_PRICE_REFRESH_OPEN_MINUTES` | `5` | Price cadence while a market is in session |
-| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Price cadence once every market is shut |
+| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Full price pass interval, and the only price cadence once every market is shut |
 | `STOCKY_QUOTE_STALE_MINUTES` | `15` | Serve a stored quote under this age, refresh behind the response |
 | `STOCKY_NEWS_REFRESH_MINUTES` | `60` | News cadence |
 | `STOCKY_SENTIMENT` | `vader` | `vader` or `finbert` |
@@ -457,7 +492,8 @@ and are set from the UI or `PUT /config`.
 
 | Job | Schedule | What it does |
 |---|---|---|
-| `refresh_prices` | 5m while a market is open, hourly otherwise | Quotes and recent bars, concurrently |
+| price stream | Continuous, a thread in the scheduler process | Live quotes for followed stocks, written every 5s in session |
+| `refresh_prices` | Hourly full pass; every 5m while a market is open, for stocks the stream left over 2 minutes stale | Quotes and recent bars, concurrently |
 | `refresh_news` | Hourly | New articles, images, sentiment, impact grading |
 | `aggregate_sentiment` | Daily 22:00 UTC | Rebuild daily rollups |
 | `prune` | Daily 03:30 UTC | Retention |

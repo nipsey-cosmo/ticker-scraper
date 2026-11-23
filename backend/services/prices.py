@@ -1,8 +1,19 @@
 """Prices, free of charge, with a real fallback chain.
 
+    0. Yahoo stream    — services/stream.py, quote row only, seconds old
     1. Yahoo chart v8  — quote *and* daily history in one request, two hosts
     2. Nasdaq quote    — US listings, real-time during the session, own host
     3. CNBC quote API  — independent host, no key, global coverage
+
+The stream sits above the chain rather than in it. It is a long-lived socket in
+the scheduler process that writes the latest regular-session tick for every
+followed stock it can price; the poll below then skips any stock whose quote is
+fresher than QUOTE_FRESH_SECONDS. Nothing tells the poll the stream is down —
+a dead stream's quotes simply age past the threshold and the five-minute poll
+takes them back. The hourly full pass ignores freshness, so daily bars, splits,
+dividends and snapshots keep arriving for streamed stocks too, which also
+means today's daily bar lags up to an hour for them. Minor-unit listings
+(pence, cents) are not streamed yet; see the ponytail in stream._session.
 
 History has its own fallback, because the chain above does not cover it: only
 Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
@@ -33,6 +44,7 @@ from __future__ import annotations
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import db
 import settings
@@ -482,7 +494,13 @@ def refresh_watchlist_intraday() -> dict:
     return {"stored": stored}
 
 
-def refresh_watchlist(range_: str = "5d") -> dict:
+# A quote younger than this is being kept current by the price stream, so the
+# fast poll leaves it alone. Comfortably more than one stream flush (5 s) plus
+# a scheduler tick's jitter, and well under the five-minute poll it defers to.
+QUOTE_FRESH_SECONDS = 120
+
+
+def refresh_watchlist(range_: str = "5d", stale_only: bool = False) -> dict:
     """Scheduled job: refresh every followed stock, concurrently.
 
     Sequentially this took one full chain-walk per stock, so a twenty-stock
@@ -490,8 +508,20 @@ def refresh_watchlist(range_: str = "5d") -> dict:
     opposite of the point. The per-host token buckets in the scraper still
     pace each source, so this parallelises across stocks without hitting any
     one source harder than the sequential version did.
+
+    `stale_only` skips every stock whose quote is under QUOTE_FRESH_SECONDS
+    old, which in practice means the ones the stream is feeding. A stock with
+    no quote at all counts as stale. Database age rather than asking the
+    stream thread is the point: it needs no shared state, and a stream that
+    dies hands its stocks back simply by going quiet.
     """
-    watched = db.watchlist.get_symbols()
+    if stale_only:
+        # price_updated_at is canonical ISO, so string order is time order.
+        cutoff = to_iso(now_utc() - timedelta(seconds=QUOTE_FRESH_SECONDS))
+        watched = [row["short_name"] for row in db.watchlist.get_watchlist()
+                   if (row["price_updated_at"] or "") < cutoff]
+    else:
+        watched = db.watchlist.get_symbols()
     if not watched:
         return {"updated": [], "failed": []}
 
