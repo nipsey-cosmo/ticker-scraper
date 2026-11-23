@@ -725,6 +725,47 @@ class TestSparkQuotes:
 
         assert called == [] and result["skipped"] == "markets closed"
 
+    def test_a_shared_symbol_quotes_every_short_name_and_unresolved_stocks_are_left_out(
+            self, stocked_db, monkeypatch):
+        """Two short names can resolve to one Yahoo symbol: it is asked for
+        once and both rows take the whole quote. A followed stock with no Yahoo
+        symbol yet stays out of the request — a None among the symbols would
+        fail the join, and with it the whole pass, every minute."""
+        import db
+
+        db.stocks.bulk_upsert_stocks([
+            {"shortName": "RKLB", "name": "Rocket Lab", "type": "STOCK", "currencyCode": "USD"},
+        ])
+        db.stocks.set_resolution("RKLB", "RKLB", "NMS", None)
+        db.watchlist.add("RKLB")
+        db.watchlist.add("TSLA")                       # followed, never resolved
+        db.watchlist.add("GHOST")                      # followed, not in the catalogue
+
+        asked = []
+        rklb = yahoo.parse_chart(chart_payload(price=70.0, previous=68.0))
+        monkeypatch.setattr(prices, "markets_open", lambda: True)
+        monkeypatch.setattr(prices.yahoo, "spark",
+                            lambda symbols: asked.extend(symbols) or {"RKLB": rklb})
+
+        result = prices.refresh_watchlist_quotes()
+
+        assert sorted(asked) == ["AAPL", "RKLB"]
+        assert sorted(result["updated"]) == ["6RJ0", "RKLB"]
+        for short_name in ("6RJ0", "RKLB"):
+            row = db.stocks.get_stock(short_name)
+            assert row["price"] == 70.0 and row["price_change"] == 2.0
+            assert row["price_change_percent"] == pytest.approx(2.941)
+            assert row["quote_currency"] == "USD"
+        assert db.stocks.get_stock("TSLA")["price"] is None
+
+    def test_the_quotes_job_is_the_spark_pass(self, monkeypatch):
+        import jobs
+
+        monkeypatch.setattr(jobs.prices, "refresh_watchlist_quotes",
+                            lambda: {"updated": ["AAPL"]})
+
+        assert jobs.refresh_quotes() == {"updated": ["AAPL"]}
+
 
 # ── Intraday bars and move attribution (3.1) ─────────────────────────────
 
