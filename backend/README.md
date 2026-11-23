@@ -498,7 +498,9 @@ arriving from both keeps the attributed copy.
 History during a Yahoo outage is coarser. CNBC's bars arrive in batches
 roughly every four days, with hourly snapshots drawing the days between; a
 split during the outage shows as a cliff at the ex-date until Yahoo reports it,
-then heals. Sydney (`.AX`) and Auckland (`.NZ`) lines get no fallback history at
+then heals. Yahoo only reports a split that falls inside the window it is asked
+for, and the scheduled refresh asks for five days, so an outage that outlasts
+the ex-date by more than that leaves the cliff for good. Sydney (`.AX`) and Auckland (`.NZ`) lines get no fallback history at
 all, because Yahoo stamps their daily bars a UTC day early and mixing the two
 sources would duplicate or drop a session.
 

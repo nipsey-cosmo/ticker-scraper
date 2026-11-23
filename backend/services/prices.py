@@ -443,6 +443,13 @@ def _history_backfill(short_name: str, yahoo_symbol: str) -> list[dict]:
     The cost: a split *during* an outage shows as a real cliff at the ex-date
     until Yahoo reports it, and then heals, since the recording rescales the
     unadjusted rows before it exactly once.
+
+    "Until Yahoo reports it" has a limit. Yahoo lists a split only when its
+    ex-date falls inside the requested range, and the scheduled refresh asks
+    for `5d`. An outage that outlasts the ex-date by more than that never
+    records the split, and the cliff stays. That was already true of Yahoo's
+    own rows before this fallback existed; it is named here so "heals" is not
+    read as a promise.
     """
     recent = db.prices.get_history(
         short_name, days_ago_iso(_HISTORY_GRACE_DAYS), interval="1d")
