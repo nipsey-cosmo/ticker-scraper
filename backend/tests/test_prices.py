@@ -375,6 +375,39 @@ class TestCnbcHistory:
         assert re.search(r"/bars/SHEL-GB/1D/\d{8}000000/\d{8}235959/unadjusted/",
                          urls[0])
 
+    # CNBC's live record for TEVA.TA, trimmed: agorot, labelled as shekels.
+    TEL_AVIV = {"symbol": "TEVA.TA", "last": "13,270.00",
+                "previous_day_closing": "13,210.00", "change": "60.00",
+                "currencyCode": "ILS", "countryCode": "IL",
+                "exchange": "Tel Aviv Stock Exchange"}
+
+    def test_tel_aviv_bars_are_agorot_whatever_the_label_says(self, monkeypatch):
+        """Yahoo calls these lines ILA and stores 132.70. Believing CNBC's
+        `ILS` would write a month of bars over those rows at 13,270."""
+        monkeypatch.setattr(prices, "_cnbc_raw", lambda symbol: dict(self.TEL_AVIV))
+        self._recording(monkeypatch, CNBC_BARS)
+
+        bar = prices._cnbc_history("TEVA.TA")[-1]
+        assert bar["close"] == 35.745
+        assert bar["volume"] == 10_519_265
+
+    def test_tel_aviv_quote_is_agorot_too(self, monkeypatch):
+        """Same record, same units: a quote left at 13,270 beside bars at
+        132.10 is the cliff the divisor exists to prevent."""
+        monkeypatch.setattr(prices, "_cnbc_raw", lambda symbol: dict(self.TEL_AVIV))
+
+        quote = prices.from_cnbc("TEVA.TA")
+        assert (quote["price"], quote["previous_close"], quote["change"]) == \
+            (132.7, 132.1, 0.6)
+        assert quote["currency"] == "ILS"
+
+    def test_shekels_quoted_anywhere_else_are_left_alone(self):
+        """The rule is Tel Aviv's quoting convention, not the currency's."""
+        assert prices._cnbc_units({"currencyCode": "ILS", "countryCode": "US"}) == \
+            ("ILS", 1.0)
+        assert prices._cnbc_units({"currencyCode": "GBp", "countryCode": "GB"}) == \
+            ("GBP", 100.0)
+
     @pytest.mark.parametrize("yahoo_symbol", ["BHP.AX", "FPH.NZ"])
     def test_sydney_and_auckland_are_skipped_without_a_request(self, monkeypatch,
                                                                 yahoo_symbol):
@@ -535,6 +568,51 @@ class TestHistoryBackfill:
         stored = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
         assert [b["close"] for b in stored] == [100.0, 110.0, 112.0]
         assert stored[0]["volume"] == 40_000_000
+
+    def test_the_ex_date_bar_itself_is_not_rescaled(self, stocked_db, monkeypatch):
+        """It traded on the new scale already — the same boundary
+        `adjust_for_split` draws for stored rows."""
+        import db
+        db.prices.record_split("AAPL", **{**self.SPLIT, "ex_date": "2026-07-27"})
+        self._bar_less_quote(monkeypatch)
+        self._counting(monkeypatch, self.UNADJUSTED)
+
+        prices.refresh_stock("AAPL")
+
+        stored = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+        assert [b["close"] for b in stored] == [100.0, 110.0]
+        assert [b["volume"] for b in stored] == [40_000_000, 40_000_000]
+
+    def test_a_split_on_the_bar_less_quote_itself_still_rescales(self, stocked_db,
+                                                                 monkeypatch):
+        """Yahoo can answer with a price, a split and no bars — a halted line.
+        The backfill reads the splits table, so that split has to be on record
+        before it runs, not after: recorded late, the old-scale bars land after
+        the one rescale that would ever have moved them."""
+        import db
+        monkeypatch.setattr(prices, "from_yahoo", lambda *a, **kw: {
+            "price": 110.0, "change": 0.0, "change_percent": 0.0,
+            "source": "yahoo", "currency": "USD", "points": [],
+            "dividends": [], "splits": [self.SPLIT]})
+        self._counting(monkeypatch, self.UNADJUSTED)
+
+        prices.refresh_stock("AAPL")
+
+        stored = db.prices.get_history("AAPL", "2026-07-01", interval="1d")
+        assert [b["close"] for b in stored] == [100.0, 110.0]
+
+    def test_the_next_utc_day_asks_again(self, stocked_db, monkeypatch):
+        """The memo is per day, not per process: a stock CNBC had nothing for
+        yesterday may have bars today."""
+        from datetime import timedelta
+        from normalize import now_utc
+        self._bar_less_quote(monkeypatch)
+        called = self._counting(monkeypatch)
+
+        prices.refresh_stock("AAPL")
+        monkeypatch.setattr(prices, "now_utc", lambda: now_utc() + timedelta(days=1))
+        prices.refresh_stock("AAPL")
+        assert len(called) == 2
 
 
 class TestCnbcNumbers:

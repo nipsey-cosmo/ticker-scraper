@@ -184,6 +184,21 @@ def _cnbc_raw(symbol: str) -> dict | None:
     return quotes[0] if quotes and isinstance(quotes[0], dict) else None
 
 
+def _cnbc_units(quote: dict) -> tuple[str, float]:
+    """(major currency, divisor) for a CNBC quote record and its bars.
+
+    CNBC's `currencyCode` is honest for London (`GBp`) and wrong for Tel Aviv:
+    TASE lines are quoted in agorot and labelled `ILS`, where Yahoo says `ILA`.
+    Checked live on TEVA.TA and LUMI.TA — 13,270.00 "ILS" against Yahoo's
+    132.70. Taken at its word that is every price a hundred times too high, in
+    the quote and in a month of stored bars alike.
+    """
+    code = quote.get("currencyCode")
+    if code == "ILS" and quote.get("countryCode") == "IL":
+        code = "ILA"
+    return yahoo.normalise_currency(code)
+
+
 def _cnbc_quote(symbol: str) -> dict | None:
     quote = _cnbc_raw(symbol)
     if not quote:
@@ -193,7 +208,7 @@ def _cnbc_quote(symbol: str) -> dict | None:
     if not price:
         return None
 
-    currency, divisor = yahoo.normalise_currency(quote.get("currencyCode"))
+    currency, divisor = _cnbc_units(quote)
     previous = _to_float(quote.get("previous_day_closing"))
     change = _to_float(quote.get("change"))
     if change is None and previous:
@@ -225,6 +240,7 @@ def _cnbc_history(yahoo_symbol: str) -> list[dict]:
     quote for the same candidate symbol — the quote's `previous_day_closing`
     matches the last bar's close, so the two share units. A quote that states
     no currency is refused outright: guessing would store pence as pounds.
+    The stated code is not taken on trust either; see `_cnbc_units`.
 
     The endpoint is unofficial and undocumented, so it can vanish without
     notice; `test_cnbc_history` in the live suite is the alarm.
@@ -246,7 +262,7 @@ def _cnbc_history(yahoo_symbol: str) -> list[dict]:
         quote = _cnbc_raw(candidate)
         if not quote or not quote.get("currencyCode"):
             continue
-        _, divisor = yahoo.normalise_currency(quote["currencyCode"])
+        _, divisor = _cnbc_units(quote)
         data = scraper.get_json(
             _CNBC_BARS_URL.format(symbol=candidate, start=start, end=end),
             headers={"Accept": "application/json, text/plain, */*"},
@@ -376,6 +392,12 @@ def refresh_stock(short_name: str, range_: str = "5d") -> dict | None:
         return None
 
     if not quote.get("points"):
+        # First, because the backfill rescales by the splits *on record*. Yahoo
+        # can answer with a price and a split but no bars (a halted line); left
+        # to `_store`, that split would be recorded after the old-scale bars
+        # were built and its one rescale would run before they were written.
+        # `_store` repeating this is a no-op: `record_split` is the guard.
+        _store_corporate_actions(short_name, quote)
         quote["points"] = _history_backfill(short_name, yahoo_symbol)
 
     _store(short_name, quote)
