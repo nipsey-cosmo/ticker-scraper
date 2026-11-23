@@ -156,7 +156,8 @@ on AAPL, RKLB and SHEL.L.
    would answer with the New York ADR at a different price in a different
    currency.
 3. **CNBC quote API.** Independent host, global coverage, accepts Yahoo-style
-   symbols directly.
+   symbols directly. Its separate daily-bar endpoint is also the history
+   fallback (below).
 
 Nasdaq splits a quote into `primaryData` (whatever is trading now) and
 `secondaryData` (the regular close once the bell goes). The regular-session
@@ -164,8 +165,13 @@ figure wins whenever present. Taking the live block blindly would store an
 after-hours print as the day's close and put a point on the chart neither other
 source agrees with.
 
-History comes from Yahoo only. If Yahoo is unavailable the quote still updates
-from a fallback and stored history stops extending: degraded, not broken.
+History comes from Yahoo while Yahoo answers. When a quote arrives without
+bars and the stored daily series is more than four days behind, a month of
+daily bars is fetched from CNBC instead, at most once per stock per UTC day.
+They are fetched *unadjusted* and rescaled by the splits already recorded, so
+they land on the same scale as the stored rows (`prices._history_backfill`
+explains why not CNBC's adjusted bars). The endpoint is unofficial; the live
+suite's `test_cnbc_history` is what notices it going.
 
 The scheduler ticks every five minutes but `jobs.refresh_prices` drops most of
 those back to hourly once every market is shut. A closed market's price cannot
@@ -489,8 +495,14 @@ Google News links aren't unwrapped, so those articles link via Google. That
 works, but weighs less in dedup tie-breaks. Bing's *are* unwrapped, so a story
 arriving from both keeps the attributed copy.
 
-History depends on Yahoo. Nasdaq and CNBC cover quotes if it is down, and
-neither returns bars.
+History during a Yahoo outage is coarser. CNBC's bars arrive in batches
+roughly every four days, with hourly snapshots drawing the days between; a
+split during the outage shows as a cliff at the ex-date until Yahoo reports it,
+then heals. Yahoo only reports a split that falls inside the window it is asked
+for, and the scheduled refresh asks for five days, so an outage that outlasts
+the ex-date by more than that leaves the cliff for good. Sydney (`.AX`) and Auckland (`.NZ`) lines get no fallback history at
+all, because Yahoo stamps their daily bars a UTC day early and mixing the two
+sources would duplicate or drop a session.
 
 Market hours are approximate. The fast/slow refresh gate uses weekday session
 windows with no holiday calendar, so a public holiday costs one wasted cycle. It

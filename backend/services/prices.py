@@ -5,10 +5,10 @@
     3. CNBC quote API  — independent host, no key, global coverage
 
 History has its own fallback, because the chain above does not cover it: only
-Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
-chart quietly frozen. Stooq (services/stooq.py) fills that gap — end-of-day
-CSV, no key — and is deliberately outside the chain, since it cannot answer
-what something is trading at right now.
+Yahoo's chart returns bars with the quote, so a Yahoo outage used to leave the
+quote fine and the chart quietly frozen. CNBC's daily-bar endpoint fills that
+gap (`_history_backfill`). It sits outside the chain because whether history
+needs topping up is a question for the database, not for the quote.
 
 Three different operators, hit through the adaptive scraper, so a throttled
 Yahoo drops its rate and the next source picks up the slack rather than the
@@ -17,7 +17,7 @@ nobody is being leaned on hard enough to notice, and no proxy or IP rotation
 is needed to stay welcome.
 
 So a throttled Yahoo now costs neither the quote nor the chart: the quote
-fails over to Nasdaq or CNBC, and the bars come from Stooq.
+fails over to Nasdaq or CNBC, and the bars come from CNBC.
 
 Everything is stored in *major* currency units: LSE quotes arrive in pence and
 Tel Aviv in agorot, and a chart that silently mixes 3323.5 with 33.235 is worse
@@ -33,15 +33,18 @@ from __future__ import annotations
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import db
 import settings
 from normalize import days_ago_iso, markets_open, now_utc, to_iso
 
-from . import stooq, symbols, yahoo
+from . import symbols, yahoo
 from .http_client import scraper
 
 _CNBC_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+_CNBC_BARS_URL = ("https://ts-api.cnbc.com/harmony/app/bars/{symbol}/1D/"
+                  "{start}/{end}/unadjusted/EST5EDT.json")
 _NASDAQ_URL = "https://api.nasdaq.com/api/quote/{symbol}/info"
 
 # Yahoo exchange suffix → CNBC country code, for the cases where CNBC will not
@@ -158,7 +161,10 @@ def _cnbc_candidates(yahoo_symbol: str) -> list[str]:
     return candidates
 
 
-def _cnbc_quote(symbol: str) -> dict | None:
+def _cnbc_raw(symbol: str) -> dict | None:
+    """CNBC's own quote record for a symbol, unparsed. Shared by the quote and
+    by `_cnbc_history`, which needs only its `currencyCode` — and since the
+    scraper caches, asking again right after the chain did costs nothing."""
     raw = scraper.get(
         _CNBC_URL,
         params={
@@ -175,15 +181,34 @@ def _cnbc_quote(symbol: str) -> dict | None:
         return None
     if isinstance(quotes, dict):
         quotes = [quotes]
-    if not quotes:
+    return quotes[0] if quotes and isinstance(quotes[0], dict) else None
+
+
+def _cnbc_units(quote: dict) -> tuple[str, float]:
+    """(major currency, divisor) for a CNBC quote record and its bars.
+
+    CNBC's `currencyCode` is honest for London (`GBp`) and wrong for Tel Aviv:
+    TASE lines are quoted in agorot and labelled `ILS`, where Yahoo says `ILA`.
+    Checked live on TEVA.TA and LUMI.TA — 13,270.00 "ILS" against Yahoo's
+    132.70. Taken at its word that is every price a hundred times too high, in
+    the quote and in a month of stored bars alike.
+    """
+    code = quote.get("currencyCode")
+    if code == "ILS" and quote.get("countryCode") == "IL":
+        code = "ILA"
+    return yahoo.normalise_currency(code)
+
+
+def _cnbc_quote(symbol: str) -> dict | None:
+    quote = _cnbc_raw(symbol)
+    if not quote:
         return None
 
-    quote = quotes[0]
     price = _to_float(quote.get("last"))
     if not price:
         return None
 
-    currency, divisor = yahoo.normalise_currency(quote.get("currencyCode"))
+    currency, divisor = _cnbc_units(quote)
     previous = _to_float(quote.get("previous_day_closing"))
     change = _to_float(quote.get("change"))
     if change is None and previous:
@@ -202,13 +227,96 @@ def _cnbc_quote(symbol: str) -> dict | None:
     }
 
 
+# Always the same window, whatever range the refresh asked Yahoo for: the
+# fallback only runs once the stored series is days behind, and a month covers
+# any gap the grace window lets open plus the chart's own span.
+_HISTORY_DAYS = 31
+
+
+def _cnbc_history(yahoo_symbol: str) -> list[dict]:
+    """A month of daily bars from CNBC, in major units. Empty on any failure.
+
+    The bars response names no currency, so the divisor comes from CNBC's own
+    quote for the same candidate symbol — the quote's `previous_day_closing`
+    matches the last bar's close, so the two share units. A quote that states
+    no currency is refused outright: guessing would store pence as pounds.
+    The stated code is not taken on trust either; see `_cnbc_units`.
+
+    The endpoint is unofficial and undocumented, so it can vanish without
+    notice; `test_cnbc_history` in the live suite is the alarm.
+    """
+    # ponytail: Yahoo stamps Sydney and Auckland daily bars one UTC day early,
+    # so CNBC's local-date bars would land a day off Yahoo's rows and duplicate
+    # or drop a session at the seam. Those venues get no fallback history.
+    # Upgrade path: fix Yahoo's stamping for them, then delete this skip.
+    if yahoo_symbol.upper().endswith((".AX", ".NZ")):
+        return []
+
+    # Whole-day stamps, so every refresh on the same day asks for the same URL
+    # and the scraper's cache can answer a repeat.
+    today = now_utc().date()
+    start = (today - timedelta(days=_HISTORY_DAYS)).strftime("%Y%m%d") + "000000"
+    end = today.strftime("%Y%m%d") + "235959"
+
+    for candidate in _cnbc_candidates(yahoo_symbol):
+        quote = _cnbc_raw(candidate)
+        if not quote or not quote.get("currencyCode"):
+            continue
+        _, divisor = _cnbc_units(quote)
+        data = scraper.get_json(
+            _CNBC_BARS_URL.format(symbol=candidate, start=start, end=end),
+            headers={"Accept": "application/json, text/plain, */*"},
+        )
+        bars = parse_cnbc_bars(data, divisor)
+        if bars:
+            return bars
+    return []
+
+
+def parse_cnbc_bars(data, divisor: float) -> list[dict]:
+    """CNBC's bar payload as stored bars, oldest first.
+
+    Split from `_cnbc_history` so it can be tested on a saved payload. Prices
+    arrive as strings in the quote's units; `tradeTime` is
+    `YYYYMMDDHHMMSS` and its date is the local trading date, which is the
+    midnight-UTC stamp every daily row uses. An unknown symbol is a 200 with
+    `status: ERROR` and no `barData`, so it simply yields nothing.
+    """
+    if not isinstance(data, dict):
+        return []
+    raw_bars = (data.get("barData") or {}).get("priceBars") or []
+
+    def major(value) -> float | None:
+        number = _to_float(value)
+        return None if number is None else round(number / divisor, 6)
+
+    bars = []
+    for bar in raw_bars:
+        if not isinstance(bar, dict):
+            continue
+        day = str(bar.get("tradeTime") or "")[:8]
+        close = major(bar.get("close"))
+        if close is None or len(day) != 8:
+            continue
+        volume = _to_float(bar.get("volume"))
+        bars.append({
+            "ts": f"{day[:4]}-{day[4:6]}-{day[6:]}T00:00:00Z",
+            "close": close,
+            "open": major(bar.get("open")),
+            "high": major(bar.get("high")),
+            "low": major(bar.get("low")),
+            # A share count, so never divided into major units.
+            "volume": None if volume is None else int(volume),
+        })
+    return bars
+
+
 def get_quote(yahoo_symbol: str, range_: str = "1mo") -> dict | None:
     """Walk the chain. None only if every source failed.
 
-    Stooq is deliberately *not* here. It is end-of-day only, so it cannot
-    answer the "what is it trading at now" question this chain exists for, and
-    deciding whether history needs topping up needs the database — see
-    `_stooq_backfill`.
+    History is deliberately *not* topped up here, even though CNBC can supply
+    bars: deciding whether it needs topping up needs the database — see
+    `_history_backfill`.
     """
     return (from_yahoo(yahoo_symbol, range_=range_)
             or from_nasdaq(yahoo_symbol)
@@ -284,7 +392,13 @@ def refresh_stock(short_name: str, range_: str = "5d") -> dict | None:
         return None
 
     if not quote.get("points"):
-        quote["points"] = _stooq_backfill(short_name, yahoo_symbol, range_)
+        # First, because the backfill rescales by the splits *on record*. Yahoo
+        # can answer with a price and a split but no bars (a halted line); left
+        # to `_store`, that split would be recorded after the old-scale bars
+        # were built and its one rescale would run before they were written.
+        # `_store` repeating this is a no-op: `record_split` is the guard.
+        _store_corporate_actions(short_name, quote)
+        quote["points"] = _history_backfill(short_name, yahoo_symbol)
 
     _store(short_name, quote)
     return quote
@@ -295,27 +409,79 @@ def refresh_stock(short_name: str, range_: str = "5d") -> dict | None:
 # that further.
 _HISTORY_GRACE_DAYS = 4
 
+# short_name → the UTC date the fallback was last asked for it. In memory only:
+# a restart costing one extra request per stale stock is not worth a table.
+_history_asked: dict[str, str] = {}
 
-def _stooq_backfill(short_name: str, yahoo_symbol: str, range_: str) -> list[dict]:
-    """Bars for a quote that arrived without them — Nasdaq and CNBC never
-    return any, so a Yahoo outage otherwise freezes the chart silently.
+
+def _history_backfill(short_name: str, yahoo_symbol: str) -> list[dict]:
+    """Bars for a quote that arrived without them — Nasdaq and CNBC quotes
+    carry none, so a Yahoo outage otherwise freezes the chart silently.
 
     Gated on the stored series actually having fallen behind, and that gate is
     the point rather than an optimisation: this runs inside the five-minute
-    price job, and Stooq is a small operation serving an end-of-day CSV.
-    Ungated, one Yahoo outage would mean a full history download per stock
-    every five minutes, all day, for a file that changes once.
+    price job, for a daily series that changes once a day. Ungated, one Yahoo
+    outage would mean a month of bars per stock every five minutes. The gate
+    alone is not enough — a stock CNBC has no bars for would stay stale and be
+    asked every tick — so it is also asked at most once per UTC day.
+
+    In a long outage bars therefore arrive in batches, roughly every
+    `_HISTORY_GRACE_DAYS`, with the hourly snapshots drawing the days between.
+
+    **Unadjusted bars, rescaled by the splits already recorded.** Stored rows
+    sit on the scale of the latest split we know of, because `_store` rescales
+    them when Yahoo reports one. Unadjusted bars dated before a recorded split
+    are divided the same way here, so they land on that scale. The two
+    alternatives both corrupt the series:
+
+    - `adjusted` bars already fold in a split that happened during the outage.
+      When Yahoo comes back and reports it, `adjust_for_split` divides those
+      rows a second time, permanently.
+    - `unadjusted` bars without this step would overwrite already-rescaled
+      rows with old-scale values.
+
+    The cost: a split *during* an outage shows as a real cliff at the ex-date
+    until Yahoo reports it, and then heals, since the recording rescales the
+    unadjusted rows before it exactly once.
+
+    "Until Yahoo reports it" has a limit. Yahoo lists a split only when its
+    ex-date falls inside the requested range, and the scheduled refresh asks
+    for `5d`. An outage that outlasts the ex-date by more than that never
+    records the split, and the cliff stays. That was already true of Yahoo's
+    own rows before this fallback existed; it is named here so "heals" is not
+    read as a promise.
     """
     recent = db.prices.get_history(
         short_name, days_ago_iso(_HISTORY_GRACE_DAYS), interval="1d")
     if recent:
         return []
 
-    bars = stooq.history(yahoo_symbol, range_=range_)
+    today = now_utc().date().isoformat()
+    if _history_asked.get(short_name) == today:
+        return []
+    _history_asked[short_name] = today
+
+    bars = _cnbc_history(yahoo_symbol)
+    for split in db.prices.get_splits(short_name):
+        ratio = split["numerator"] / split["denominator"]
+        bars = [_rescaled(bar, ratio) if bar["ts"] < split["ex_date"] else bar
+                for bar in bars]
+
     if bars:
         print(f"[prices] {short_name}: history had gone stale, "
-              f"{len(bars)} bars from stooq")
+              f"{len(bars)} bars from cnbc")
     return bars
+
+
+def _rescaled(bar: dict, ratio: float) -> dict:
+    """One bar moved across a split, the way `db.prices.adjust_for_split`
+    moves a stored row: prices divide by the ratio, volume multiplies."""
+    return {
+        **bar,
+        **{k: round(bar[k] / ratio, 6) for k in ("close", "open", "high", "low")
+           if bar.get(k) is not None},
+        "volume": None if bar.get("volume") is None else int(bar["volume"] * ratio),
+    }
 
 
 def _store(short_name: str, quote: dict) -> None:

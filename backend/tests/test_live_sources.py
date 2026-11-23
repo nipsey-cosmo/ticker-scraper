@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 import settings
-from services import calendar, prices, social, stooq, yahoo
+from services import calendar, prices, social, yahoo
 from services.news import (bing_news, finviz, google_news, nasdaq_news,
                            rns, sec_edgar, wires, yahoo_news)
 
@@ -113,14 +113,10 @@ class TestPriceSources:
         quote = prices.get_quote(TICKER, range_="5d")
         assert quote and quote.get("price"), "no source produced a quote"
 
-    @pytest.mark.xfail(
-        reason="stooq serves a JS browser-check interstitial with a 200 instead "
-               "of CSV — the anti-bot wall 3.4 exists to get past",
-        strict=False,
-    )
-    def test_stooq_history(self):
-        bars = stooq.history(TICKER, range_="1mo")
-        assert bars, "stooq returned no history"
+    def test_cnbc_history(self):
+        """The history fallback's endpoint is unofficial; this is its alarm."""
+        bars = prices._cnbc_history(TICKER)
+        assert bars, "cnbc returned no history"
         assert bars[-1].get("close") is not None
 
 

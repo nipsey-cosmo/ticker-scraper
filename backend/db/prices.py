@@ -36,7 +36,7 @@ def upsert_points(short_name: str, points, interval: str = "1d") -> int:
     The tuple form exists because most callers genuinely have nothing but a
     close — an hourly snapshot is one number — and making them all build a
     dict to say so would be noise. Sources that return real bars (Yahoo's
-    chart, Stooq) pass dicts.
+    chart, CNBC's bars) pass dicts.
 
     A missing OHLC field is stored NULL rather than defaulted: zero would
     render as a real trade at zero.
