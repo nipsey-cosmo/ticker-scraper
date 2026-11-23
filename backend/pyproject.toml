@@ -32,7 +32,7 @@ dependencies = [
     # `pool` because a Postgres connect is a round trip, unlike opening a file.
     "psycopg[binary,pool] (>=3.3.4,<4.0.0)",
     # A browser TLS fingerprint for the hosts that refuse OpenSSL's at the
-    # handshake (stooq, accessnewswire). Off unless STOCKY_SCRAPE_IMPERSONATE
+    # handshake (accessnewswire). Off unless STOCKY_SCRAPE_IMPERSONATE
     # is set, but a required install rather than an extra: it is a few MB, and
     # an extra nobody installs is a fallback chain that stays broken.
     "curl-cffi (>=0.13.0,<0.14.0)",

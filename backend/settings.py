@@ -127,9 +127,8 @@ EMBED_SIMILARITY = _float("STOCKY_EMBED_SIMILARITY", 0.82)
 # httpx negotiates TLS through OpenSSL, and that ClientHello has been in
 # anti-bot fingerprint databases since 2017. A host behind Cloudflare Bot
 # Management can therefore refuse at the handshake, before it has read a single
-# one of our carefully rotated headers. Two are doing it right now: stooq.com
-# answers its CSV endpoint with a 200 carrying a browser-check page, and
-# accessnewswire.com returns a flat 403.
+# one of our carefully rotated headers. accessnewswire.com does exactly that,
+# with a flat 403.
 #
 # Set to a curl_cffi target ("chrome", "safari", "firefox", or a pinned version
 # like "chrome131") to present a real browser fingerprint instead. Empty — the

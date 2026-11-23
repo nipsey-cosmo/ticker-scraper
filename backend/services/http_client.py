@@ -122,10 +122,7 @@ _HOST_RATES: dict[str, tuple[float, float]] = {
     "www.sec.gov": (2.0, 4.0),
     "data.sec.gov": (2.0, 4.0),
     "quote.cnbc.com": (2.0, 6.0),
-    # A CSV download rather than an API, and a small operation. Kept low
-    # deliberately: it is a fallback, so it only runs when something else has
-    # already failed, and it never needs to be fast.
-    "stooq.com": (0.5, 2.0),
+    "ts-api.cnbc.com": (1.0, 3.0),
     # One call an hour for the whole watchlist. It never needs headroom.
     "apewisdom.io": (0.5, 2.0),
 }

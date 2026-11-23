@@ -79,6 +79,9 @@ differently:
   assumption that 3.4 would revive it was wrong. Getting past a JS challenge
   is the proxy/CAPTCHA territory `http_client.py` deliberately refuses, so the
   answer here is another end-of-day source, not more transport work.
+  **Resolved:** Stooq is gone, replaced by CNBC's daily-bar endpoint
+  (`prices._cnbc_history`), fetched unadjusted and rescaled by recorded splits.
+  `.AX` and `.NZ` lines get no fallback history (see the `ponytail:` note there).
 
 **Deferred, named:** the semantic pass (3.2) ships off. It needs
 `STOCKY_EMBED_MODEL` and `--extras semantic`, which pulls torch — the same
