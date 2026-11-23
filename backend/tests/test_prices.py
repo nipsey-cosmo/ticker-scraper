@@ -621,6 +621,111 @@ class TestStoring:
         assert db.prices.latest("AAPL")["close"] == 339.00
 
 
+# ── Spark batch quotes ───────────────────────────────────────────────────
+
+def spark_entry(symbol, **chart):
+    """One spark result: a chart node wrapped under the symbol it answers."""
+    node = chart_payload(**chart)["chart"]["result"][0]
+    node["meta"]["symbol"] = symbol
+    return {"symbol": symbol, "response": [node]}
+
+
+def spark_payload(*entries):
+    return {"spark": {"result": list(entries)}}
+
+
+class TestSpark:
+    def test_spark_is_keyed_by_symbol_not_position(self, monkeypatch):
+        """Spark answers in no fixed order and silently drops an unknown
+        symbol, so reading results by position would quote MSFT as AAPL."""
+        payload = spark_payload(spark_entry("MSFT", price=500.0),
+                                spark_entry("AAPL", price=338.19))
+        monkeypatch.setattr(yahoo, "_try_hosts", lambda *a, **kw: payload)
+
+        quotes = yahoo.spark(["AAPL", "NOPE", "MSFT"])
+
+        assert set(quotes) == {"AAPL", "MSFT"}
+        assert quotes["AAPL"]["price"] == 338.19
+        assert quotes["MSFT"]["price"] == 500.0
+
+    def test_an_lse_spark_quote_is_converted_to_pounds(self, monkeypatch):
+        payload = spark_payload(spark_entry(
+            "SHEL.L", currency="GBp", price=3567.0, previous=3574.5))
+        monkeypatch.setattr(yahoo, "_try_hosts", lambda *a, **kw: payload)
+
+        quote = yahoo.spark(["SHEL.L"])["SHEL.L"]
+
+        assert quote["currency"] == "GBP"
+        assert quote["price"] == pytest.approx(35.67)
+        assert quote["change"] == pytest.approx(-0.075)
+        assert quote["change_percent"] == pytest.approx(-0.21, abs=1e-2)
+
+    def test_an_entry_without_previous_close_is_dropped(self, monkeypatch):
+        """parse_chart would fall back to the prior bar, which in spark's
+        series is five minutes ago — a five-minute move stored as the day's."""
+        payload = spark_payload(spark_entry("AAPL", previous=None),
+                                spark_entry("MSFT", price=500.0))
+        monkeypatch.setattr(yahoo, "_try_hosts", lambda *a, **kw: payload)
+
+        assert set(yahoo.spark(["AAPL", "MSFT"])) == {"MSFT"}
+
+    def test_more_than_twenty_symbols_split_and_a_failed_chunk_costs_only_itself(
+            self, monkeypatch):
+        """A twenty-first symbol fails the whole request with a 400."""
+        symbols = [f"S{i:02d}" for i in range(45)]
+        asked = []
+
+        def fake(hosts, path, params, cache=True):
+            chunk = params["symbols"].split(",")
+            asked.append(chunk)
+            if len(asked) == 2:
+                return None                            # this chunk fails
+            return spark_payload(*(spark_entry(s) for s in chunk))
+
+        monkeypatch.setattr(yahoo, "_try_hosts", fake)
+
+        quotes = yahoo.spark(symbols)
+
+        assert [len(c) for c in asked] == [20, 20, 5]
+        assert sorted(quotes) == symbols[:20] + symbols[40:]
+
+
+class TestSparkQuotes:
+    def test_spark_quotes_update_the_row_and_store_no_bars(self, stocked_db, monkeypatch):
+        """Quote only. `_store` would file spark's 5m closes as daily bars, and
+        the quote belongs to the short name, not the Yahoo symbol it was asked
+        under."""
+        import db
+
+        asked = []
+        rklb = yahoo.parse_chart(chart_payload(price=70.0, previous=68.0))
+        monkeypatch.setattr(prices, "markets_open", lambda: True)
+        monkeypatch.setattr(prices.yahoo, "spark",
+                            lambda symbols: asked.extend(symbols) or {"RKLB": rklb})
+
+        result = prices.refresh_watchlist_quotes()
+
+        assert sorted(asked) == ["AAPL", "RKLB"]
+        assert result["updated"] == ["6RJ0"]
+        row = db.stocks.get_stock("6RJ0")
+        assert row["price"] == 70.0 and row["price_change"] == 2.0
+        assert row["price_updated_at"]
+        assert db.stocks.get_stock("RKLB") is None
+        assert db.stocks.get_stock("AAPL")["price"] == 338.19      # not answered
+        assert db.prices.latest("6RJ0")["close"] == 70.0           # the snapshot
+        for interval in ("1d", db.prices.INTRADAY):
+            assert db.prices.get_history("6RJ0", "2000-01-01", interval=interval) == []
+
+    def test_a_shut_market_never_requests_quotes(self, stocked_db, monkeypatch):
+        called = []
+        monkeypatch.setattr(prices, "markets_open", lambda: False)
+        monkeypatch.setattr(prices.yahoo, "spark", lambda symbols: called.append(symbols) or {})
+
+        result = prices.refresh_watchlist_quotes()
+
+        assert called == [] and result["skipped"] == "markets closed"
+
+
 # ── Intraday bars and move attribution (3.1) ─────────────────────────────
 
 # 2026-08-27, a Thursday. 13:30–20:00 UTC is the New York regular session.
@@ -677,6 +782,12 @@ class TestIntradayCaching:
         seen = self._capture(monkeypatch)
         yahoo.chart("AAPL", range_="1mo", interval="1d")
         assert seen["cache"] is True
+
+    def test_spark_requests_skip_the_cache(self, monkeypatch):
+        """A one-minute quote behind a five-minute cache is a five-minute quote."""
+        seen = self._capture(monkeypatch)
+        yahoo.spark(["AAPL"])
+        assert seen["cache"] is False
 
 
 class TestSessionFilter:
@@ -923,3 +1034,107 @@ class TestIntradaySessionGate:
 
         assert sorted(called) == ["6RJ0", "AAPL"]
         assert result["stored"] == 10
+
+
+class TestPriceCadence:
+    """jobs.refresh_prices on its five-minute tick: the full chart pass once an
+    hour, open or shut; in between, the chain for stale quotes while open and
+    nothing while shut."""
+
+    @staticmethod
+    def _clock(monkeypatch, start):
+        from types import SimpleNamespace
+
+        import jobs
+
+        now = [start]
+        monkeypatch.setattr(jobs, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        # Left at its module default, so the start-up case tests the real
+        # initial value; setattr only makes sure the test's stamps are undone.
+        monkeypatch.setattr(jobs, "_last_price_refresh", jobs._last_price_refresh)
+        return now
+
+    @staticmethod
+    def _passes(monkeypatch):
+        import jobs
+
+        calls = []
+        monkeypatch.setattr(jobs.prices, "refresh_watchlist",
+                            lambda **kw: calls.append(kw) or {"updated": [], "failed": []})
+        return calls
+
+    def test_closed_market_ticks_stay_hourly(self, monkeypatch):
+        import jobs
+
+        # Five seconds after boot: the start-up pass must still run.
+        now = self._clock(monkeypatch, 5.0)
+        calls = self._passes(monkeypatch)
+        monkeypatch.setattr(jobs, "markets_open", lambda: False)
+
+        jobs.refresh_prices()
+        now[0] += 300
+        skipped = jobs.refresh_prices()
+        now[0] += 3300
+        jobs.refresh_prices()
+
+        assert skipped["skipped"] == "markets closed"
+        assert calls == [{"range_": "5d"}, {"range_": "5d"}]
+
+    def test_the_full_chart_pass_still_runs_hourly_while_open(self, monkeypatch):
+        import jobs
+
+        now = self._clock(monkeypatch, 10_000.0)
+        calls = self._passes(monkeypatch)
+        monkeypatch.setattr(jobs, "markets_open", lambda: True)
+
+        for _ in range(13):                    # an hour of five-minute ticks
+            jobs.refresh_prices()
+            now[0] += 300
+
+        assert calls[0] == calls[12] == {"range_": "5d"}
+        assert calls[1:12] == [{"stale_only": True}] * 11
+
+    def test_an_open_tick_only_walks_stale_quotes(self, stocked_db, monkeypatch):
+        """Spark keeps AAPL fresh; 6RJ0 has never been quoted. If spark then
+        fails outright, every quote goes stale and every stock falls back."""
+        from datetime import timedelta
+
+        import db
+        import jobs
+        import settings
+        from normalize import now_utc, to_iso
+
+        now = self._clock(monkeypatch, 10_000.0)
+        monkeypatch.setattr(jobs, "_last_price_refresh", now[0])   # not due
+        monkeypatch.setattr(jobs, "markets_open", lambda: True)
+        walked = []
+        monkeypatch.setattr(prices, "refresh_stock",
+                            lambda short_name, **kw: walked.append(short_name) or {"price": 1.0})
+        monkeypatch.setattr(prices, "ensure_classified", lambda stock: False)
+
+        jobs.refresh_prices()
+        assert walked == ["6RJ0"]
+
+        # A minute past two spark intervals.
+        age = timedelta(minutes=2 * settings.QUOTE_REFRESH_MINUTES + 1)
+        with db.get_connection() as conn:
+            conn.execute("UPDATE stocks SET price_updated_at = %s WHERE short_name = 'AAPL'",
+                         (to_iso(now_utc() - age),))
+        walked.clear()
+        now[0] += 300
+        jobs.refresh_prices()
+        assert sorted(walked) == ["6RJ0", "AAPL"]
+
+
+def test_scheduler_has_a_minute_quotes_job():
+    """Importing scheduler builds the jobs without starting anything."""
+    from datetime import timedelta
+
+    import jobs
+    import scheduler
+    import settings
+
+    job = scheduler.scheduler.get_job("quotes")
+    assert job.func is jobs.refresh_quotes
+    assert job.trigger.interval == timedelta(minutes=settings.QUOTE_REFRESH_MINUTES)
+    assert not scheduler.scheduler.running

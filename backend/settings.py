@@ -71,10 +71,15 @@ CORS_ORIGINS = [
 
 # ── Data freshness ───────────────────────────────────────────────────────
 BACKFILL_DAYS = _int("STOCKY_BACKFILL_DAYS", 30)      # history pulled for a new follow
-# Prices are refreshed on the fast cadence while any major market is in
-# session and on the slow one outside it. A closed market's price cannot move,
-# so polling it every few minutes would be load on someone else's servers in
-# exchange for an unchanged number.
+# Three price cadences, and only the hourly one keeps running once every major
+# market is shut: a closed market's price cannot move, so polling it would be
+# load on someone else's servers in exchange for an unchanged number.
+#   QUOTE_REFRESH_MINUTES       batch quotes from Yahoo spark, only while open
+#   PRICE_REFRESH_OPEN_MINUTES  the chart chain, only for quotes spark left
+#                               stale (older than two quote intervals)
+#   PRICE_REFRESH_MINUTES       the full chart pass: daily bars, splits and
+#                               dividends — hourly, open or shut
+QUOTE_REFRESH_MINUTES = _int("STOCKY_QUOTE_REFRESH_MINUTES", 1)
 PRICE_REFRESH_OPEN_MINUTES = _int("STOCKY_PRICE_REFRESH_OPEN_MINUTES", 5)
 PRICE_REFRESH_MINUTES = _int("STOCKY_PRICE_REFRESH_MINUTES", 60)
 NEWS_REFRESH_MINUTES = _int("STOCKY_NEWS_REFRESH_MINUTES", 60)

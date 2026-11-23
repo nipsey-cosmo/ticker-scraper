@@ -13,16 +13,25 @@ import settings
 
 scheduler = BlockingScheduler(timezone="UTC")
 
-# Prices on the fast cadence. `jobs.refresh_prices` drops most of these ticks
-# back to the hourly interval once every market is shut, so this buys a price
-# that is minutes old during the session without scraping all night.
+# Batch quotes every minute; the job returns at once whenever every market is
+# shut, so it buys a one-minute price in session without scraping all night.
+scheduler.add_job(
+    jobs.refresh_quotes, "interval",
+    minutes=settings.QUOTE_REFRESH_MINUTES, id="quotes",
+    max_instances=1, coalesce=True,
+)
+
+# The chart chain on a five-minute tick: the full pass (daily bars, splits,
+# dividends) once an hour, and in between, during a session, only the quotes
+# the spark job left stale. Shut, the in-between ticks do nothing.
 scheduler.add_job(
     jobs.refresh_prices, "interval",
     minutes=settings.PRICE_REFRESH_OPEN_MINUTES, id="prices",
     max_instances=1, coalesce=True,
 )
 
-# Intraday bars ride the same fast cadence as the quote, and skip themselves
+# Intraday bars stay on the five-minute tick (spark's 5m series is close-only,
+# no volume or OHLC, so it cannot stand in for them) and skip themselves
 # outside session hours. Attribution rides along with them.
 scheduler.add_job(
     jobs.refresh_intraday, "interval",
@@ -65,8 +74,9 @@ scheduler.add_job(
 
 def main() -> None:
     db.create_tables()
-    print(f"[scheduler] prices every {settings.PRICE_REFRESH_OPEN_MINUTES}m while a market "
-          f"is open ({settings.PRICE_REFRESH_MINUTES}m otherwise), "
+    print(f"[scheduler] quotes every {settings.QUOTE_REFRESH_MINUTES}m while a market is "
+          f"open (stale ones re-checked every {settings.PRICE_REFRESH_OPEN_MINUTES}m), "
+          f"full price pass every {settings.PRICE_REFRESH_MINUTES}m, "
           f"news every {settings.NEWS_REFRESH_MINUTES}m "
           f"(filings every {settings.NEWS_FAST_MINUTES}m)")
 

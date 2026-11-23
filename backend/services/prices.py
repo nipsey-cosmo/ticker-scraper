@@ -1,8 +1,24 @@
 """Prices, free of charge, with a real fallback chain.
 
+While a market is open, quotes come first from Yahoo spark: one request per
+twenty followed stocks, every minute (`refresh_watchlist_quotes`). It writes
+the quote and nothing else — its series is a close-only 5m line, not daily
+bars. Spark is undocumented, so nothing relies on it alone. Beneath it sits the
+per-stock chain, walked every five minutes for any quote spark has left stale
+and hourly for every stock, because only the chart call brings daily bars,
+splits and dividends:
+
     1. Yahoo chart v8  — quote *and* daily history in one request, two hosts
     2. Nasdaq quote    — US listings, real-time during the session, own host
     3. CNBC quote API  — independent host, no key, global coverage
+
+If spark misses a symbol or vanishes outright, quotes degrade to exactly that
+five-minute chain. The costs of the split, stated rather than hidden: today's
+daily bar is refreshed hourly, so in session the chart's last point can trail
+the header price by up to an hour, and a split's rescale of stored history can
+trail the post-split quote by as long. Every quote write also fires the
+`stocks` change notification, so open browser tabs re-fetch once a minute
+during a session.
 
 History has its own fallback, because the chain above does not cover it: only
 Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
@@ -33,6 +49,7 @@ from __future__ import annotations
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import db
 import settings
@@ -482,8 +499,57 @@ def refresh_watchlist_intraday() -> dict:
     return {"stored": stored}
 
 
-def refresh_watchlist(range_: str = "5d") -> dict:
-    """Scheduled job: refresh every followed stock, concurrently.
+def refresh_watchlist_quotes() -> dict:
+    """Scheduled, every minute: spark quotes for every followed stock.
+
+    Quote only — the `stocks` row and the hourly snapshot. Never `_store`,
+    which would file spark's 5m closes as daily bars. The quote lands on the
+    stock's own short name, not the Yahoo symbol: `6RJ0` is quoted as `RKLB`,
+    and several short names can share one Yahoo symbol.
+
+    No fallback in here on purpose. A symbol spark cannot answer would be
+    retried every minute; instead its quote goes stale and the five-minute
+    stale-only pass in jobs.refresh_prices walks the chain for it. Stocks not
+    yet resolved to a Yahoo symbol are skipped for the same reason — that pass
+    resolves them.
+    """
+    if not markets_open():
+        return {"skipped": "markets closed"}
+
+    names_by_symbol: dict[str, list[str]] = {}
+    for row in db.watchlist.get_watchlist():
+        if row.get("yahoo_symbol"):
+            names_by_symbol.setdefault(row["yahoo_symbol"], []).append(row["short_name"])
+    if not names_by_symbol:
+        return {"updated": []}
+
+    rows = []
+    for symbol, quote in yahoo.spark(list(names_by_symbol)).items():
+        for short_name in names_by_symbol.get(symbol, []):
+            _store_snapshot(short_name, quote["price"])
+            rows.append({
+                "short_name": short_name,
+                "price": quote["price"],
+                "change": quote.get("change"),
+                "change_percent": quote.get("change_percent"),
+                "currency": quote.get("currency"),
+            })
+    db.stocks.bulk_set_quotes(rows)
+
+    updated = [r["short_name"] for r in rows]
+    print(f"[prices] spark quoted {len(updated)} of "
+          f"{sum(map(len, names_by_symbol.values()))}")
+    return {"updated": updated}
+
+
+def refresh_watchlist(range_: str = "5d", stale_only: bool = False) -> dict:
+    """Scheduled job: walk the chain for followed stocks, concurrently.
+
+    Every followed stock by default — the hourly pass that brings daily bars,
+    splits and dividends. `stale_only` narrows it to stocks whose quote is
+    older than two spark intervals, which is the fallback for whatever spark
+    missed: if spark fails wholesale, every quote goes stale and this is the
+    old five-minute chain at the old attempt rate.
 
     Sequentially this took one full chain-walk per stock, so a twenty-stock
     watchlist was minutes behind the market by the time it finished — the
@@ -491,7 +557,14 @@ def refresh_watchlist(range_: str = "5d") -> dict:
     pace each source, so this parallelises across stocks without hitting any
     one source harder than the sequential version did.
     """
-    watched = db.watchlist.get_symbols()
+    if stale_only:
+        cutoff = to_iso(now_utc() - timedelta(minutes=2 * settings.QUOTE_REFRESH_MINUTES))
+        # price_updated_at is canonical ISO, so string order is time order.
+        # A stock never quoted has none and compares as "" — stale.
+        watched = [row["short_name"] for row in db.watchlist.get_watchlist()
+                   if (row.get("price_updated_at") or "") < cutoff]
+    else:
+        watched = db.watchlist.get_symbols()
     if not watched:
         return {"updated": [], "failed": []}
 
