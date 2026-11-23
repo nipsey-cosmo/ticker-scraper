@@ -300,6 +300,7 @@ class TestCollectionAccounting:
             (news_pkg.sec_edgar, ("fetch", "full_text")),
             (news_pkg.wires, ("for_stock",)),
             (news_pkg.rns, ("for_stock",)),
+            (news_pkg.sitemaps, ("for_stock",)),
         ):
             for name in names:
                 monkeypatch.setattr(module, name, lambda *a, **kw: [])
@@ -317,7 +318,7 @@ class TestCollectionAccounting:
         # the SEC, not the LSE, so it is recorded as skipped rather than asked.
         assert set(rows) == {"GOOGLE_NEWS", "YAHOO_SEARCH", "YAHOO_RSS",
                              "BING_NEWS", "WIRES", "FINVIZ", "NASDAQ",
-                             "SEC_EDGAR", "SEC_FULLTEXT", "RNS"}
+                             "SEC_EDGAR", "SEC_FULLTEXT", "RNS", "SITEMAPS"}
         asked = [r for source, r in rows.items() if source != "RNS"]
         assert all(r["fetches"] == 1 and r["skips"] == 0 for r in asked)
         assert rows["RNS"]["skips"] == 1 and rows["RNS"]["fetches"] == 0

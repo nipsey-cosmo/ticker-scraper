@@ -70,7 +70,12 @@ _CLUSTER_WINDOW = timedelta(hours=72)
 # generic market news when they have nothing for a ticker: asking for IVU.DE
 # returned "Warsh-led Fed leaves rates on hold" and a Jersey Mike's IPO notice.
 # So they, like Google News, must name the stock to count.
-_RELATED_ALLOWED = frozenset({"FINVIZ"})
+#
+# The publisher sitemaps are trusted for the same reason Finviz is: an unnamed
+# item only gets this far when the publisher's own editors tagged the article
+# with this stock's symbol, and that tag is the curation. Nothing else about
+# them is trusted — spam, churn and the other-company test below still apply.
+_RELATED_ALLOWED = frozenset({"FINVIZ", "SITEMAPS"})
 
 DIRECT = "direct"
 RELATED = "related"

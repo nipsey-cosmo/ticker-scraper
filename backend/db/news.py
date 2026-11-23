@@ -287,7 +287,9 @@ def get_unscored(limit: int = 500) -> list[dict]:
 
 def get_missing_images(short_names: list[str], limit: int = 12) -> list[dict]:
     """Newest image-less articles worth an og:image lookup. Google redirect
-    links are excluded: resolving those costs a request and rarely yields one."""
+    links are excluded: resolving those costs a request and rarely yields one.
+    So is Benzinga, whose article pages answer this client with Cloudflare's
+    403 — which the scraper reads as throttling, and retries."""
     if not short_names:
         return []
     marks = ",".join(["%s"] * len(short_names))
@@ -296,7 +298,7 @@ def get_missing_images(short_names: list[str], limit: int = 12) -> list[dict]:
             SELECT id, url FROM news
             WHERE short_name IN ({marks})
               AND image IS NULL
-              AND source_domain NOT IN ('news.google.com', '')
+              AND source_domain NOT IN ('news.google.com', 'benzinga.com', '')
               AND source_domain IS NOT NULL
             ORDER BY publish_time DESC, id DESC LIMIT %s
         """, [*short_names, limit]))
@@ -305,9 +307,11 @@ def get_missing_images(short_names: list[str], limit: int = 12) -> list[dict]:
 def get_missing_bodies(news_ids: list[UUID], limit: int = 8) -> list[dict]:
     """Articles from this refresh that have no text yet and might yield some.
 
-    Two domains are excluded rather than tried: a Google `CBMi...` redirect has
-    no article behind it, only a consent page, and an SEC filing is megabytes
-    of XBRL whose useful content is already in the title `sec_edgar` builds.
+    Three domains are excluded rather than tried: a Google `CBMi...` redirect
+    has no article behind it, only a consent page; an SEC filing is megabytes
+    of XBRL whose useful content is already in the title `sec_edgar` builds;
+    and Benzinga's article pages refuse this client with a 403, so each would
+    spend one of the eight slots on retries that cannot succeed.
     """
     if not news_ids:
         return []
@@ -316,7 +320,7 @@ def get_missing_bodies(news_ids: list[UUID], limit: int = 8) -> list[dict]:
             SELECT id, url FROM news
             WHERE id = ANY(%s)
               AND body IS NULL
-              AND source_domain NOT IN ('news.google.com', 'sec.gov', '')
+              AND source_domain NOT IN ('news.google.com', 'sec.gov', 'benzinga.com', '')
               AND source_domain IS NOT NULL
             ORDER BY publish_time DESC, id DESC LIMIT %s
         """, (list(news_ids), limit)))

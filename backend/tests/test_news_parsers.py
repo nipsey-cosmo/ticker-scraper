@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.news import (extract, finviz, google_news, images, publishers,
-                          rns, wires, yahoo_news)
+                          rns, sitemaps, wires, yahoo_news)
 
 GOOGLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -460,6 +460,19 @@ class TestBodyBackfill:
         assert extract.fill_bodies(ids) == 0
         assert calls == []
 
+    def test_a_benzinga_page_is_skipped_without_a_fetch(self, stocked_db, monkeypatch):
+        """Its article pages answer a Cloudflare 403, which the scraper retries
+        as throttling — a body slot spent on nothing."""
+        ids = self._stored(url="https://www.benzinga.com/news/26/11/1/a-story",
+                           source_domain="benzinga.com")
+
+        calls = []
+        monkeypatch.setattr(extract.scraper, "get_many",
+                            lambda reqs: calls.append(reqs) or [])
+
+        assert extract.fill_bodies(ids) == 0
+        assert calls == []
+
     def test_a_good_page_is_stored_and_read_by_the_scorer(self, stocked_db, monkeypatch):
         import db
         from types import SimpleNamespace
@@ -651,6 +664,7 @@ class TestRnsGating:
             (news_pkg.sec_edgar, ("fetch", "full_text")),
             (news_pkg.wires, ("for_stock",)),
             (news_pkg.rns, ("for_stock",)),
+            (news_pkg.sitemaps, ("for_stock",)),
         ):
             for name in names:
                 monkeypatch.setattr(module, name, lambda *a, **kw: [])
@@ -740,3 +754,309 @@ class TestRnsFirehose:
         assert rns.for_stock("EXM", "Example Mining plc") == []
         assert rns.for_stock("NWG", "Northern Widget Group") == []
         assert len(calls) == 1
+
+
+# ── Publisher news sitemaps ──────────────────────────────────────────────
+#
+# Synthetic, like the RNS fixture: these are publishers' headlines, and their
+# terms were never read. The shapes are the real ones — CNBC's `n:` prefix,
+# everyone else's `news:` with an `image:` block after the article.
+
+SITEMAP_N = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:n="http://www.google.com/schemas/sitemap-news/0.9">
+<url><loc>https://www.example-news.com/2026/11/23/chip-stocks-slide.html</loc><n:news>
+  <n:publication><n:name>Example News</n:name><n:language>en</n:language></n:publication>
+  <n:stock_tickers>NVDA,AMD</n:stock_tickers>
+  <n:title>Chipmaker shares slide as export curbs bite</n:title>
+  <n:publication_date>2026-11-23T10:15:00-04:00</n:publication_date>
+</n:news></url>
+<url><loc>https://www.example-news.com/2026/11/23/chipaktien-fallen.html</loc><n:news>
+  <n:publication><n:name>Example News</n:name><n:language>de</n:language></n:publication>
+  <n:title>Chipaktien fallen nach neuen Exportregeln</n:title>
+  <n:publication_date>2026-11-23T10:20:00-04:00</n:publication_date>
+</n:news></url>
+</urlset>"""
+
+SITEMAP_NEWS = """<?xml version='1.0'?>
+<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'
+        xmlns:news='http://www.google.com/schemas/sitemap-news/0.9'
+        xmlns:image='http://www.google.com/schemas/sitemap-image/1.1'>
+  <url>
+    <loc>https://www.example-markets.com/story/nvidia-earnings-lift-chips</loc>
+    <news:news>
+      <news:publication><news:name>Example Markets</news:name><news:language>en</news:language></news:publication>
+      <news:publication_date>2026-11-23T14:18:56.615Z</news:publication_date>
+      <news:title>Nvidia's earnings beat lifts the whole chip sector</news:title>
+      <news:stock_tickers>NVDA, US:NVDA</news:stock_tickers>
+    </news:news>
+    <image:image>
+      <image:loc>https://images.example-markets.com/im-1?width=1280</image:loc>
+      <image:title>Jensen Huang on stage</image:title>
+    </image:image>
+  </url>
+  <url>
+    <loc>https://www.example-markets.com/data-news/apple-stock-rises-monday</loc>
+    <news:news>
+      <news:publication><news:name>Example Markets</news:name><news:language>en</news:language></news:publication>
+      <news:publication_date>2026-11-23T15:00:00Z</news:publication_date>
+      <news:title>Apple Inc. stock rises Monday, outperforms market</news:title>
+      <news:stock_tickers>AAPL</news:stock_tickers>
+    </news:news>
+  </url>
+  <url>
+    <loc>https://www.example-markets.com/story/untitled</loc>
+    <news:news><news:title></news:title></news:news>
+  </url>
+</urlset>"""
+
+
+def sitemap(*entries, when=None) -> str:
+    """A `news:` sitemap of (path, title, tickers) entries, published now.
+
+    Built per test rather than fixed: `fetch` drops anything over three days
+    old, so a dated fixture would start failing the week after it was written.
+    """
+    from normalize import now_utc
+    stamp = (when or now_utc()).isoformat()
+    urls = "".join(
+        f"<url><loc>https://www.example-markets.com{path}</loc><news:news>"
+        f"<news:publication><news:name>Example Markets</news:name>"
+        f"<news:language>en</news:language></news:publication>"
+        f"<news:publication_date>{stamp}</news:publication_date>"
+        f"<news:title>{title}</news:title>"
+        f"<news:stock_tickers>{tickers}</news:stock_tickers></news:news></url>"
+        for path, title, tickers in entries)
+    return ('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" '
+            'xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'
+            f"{urls}</urlset>")
+
+
+def serve_sitemap(monkeypatch, body, calls=None):
+    """Every feed answers with `body`, from an empty cache."""
+    monkeypatch.setattr(sitemaps, "_cache", None)
+
+    def get(url, **kwargs):
+        if calls is not None:
+            calls.append(url)
+        return None if body is None else SimpleNamespace(ok=True, text=body)
+
+    monkeypatch.setattr(sitemaps.scraper, "get", get)
+
+
+class TestSitemapParsing:
+    def test_either_namespace_prefix_parses(self):
+        """The prefix is each publisher's choice, so tags are matched on their
+        local name. The German entry goes: dedup cannot match it to English."""
+        cnbc = sitemaps.parse(SITEMAP_N, "CNBC")
+        assert [a["title"] for a in cnbc] == ["Chipmaker shares slide as export curbs bite"]
+        assert cnbc[0]["tickers"] == {"NVDA", "AMD"}
+        assert cnbc[0]["source_domain"] == "example-news.com"
+        assert cnbc[0]["source_type"] == "SITEMAPS"
+
+        others = sitemaps.parse(SITEMAP_NEWS, "Example Markets")
+        assert [a["title"] for a in others] == [
+            "Nvidia's earnings beat lifts the whole chip sector",
+            "Apple Inc. stock rises Monday, outperforms market",
+        ]
+
+    def test_the_article_title_is_not_the_image_title(self):
+        """The image block carries its own `loc` and `title`. Walking the whole
+        entry with iter() would let them overwrite the article's."""
+        article = sitemaps.parse(SITEMAP_NEWS, "Example Markets")[0]
+        assert article["title"] == "Nvidia's earnings beat lifts the whole chip sector"
+        assert article["url"] == "https://www.example-markets.com/story/nvidia-earnings-lift-chips"
+        assert article["image"] == "https://images.example-markets.com/im-1?width=1280"
+        assert article["description"] is None
+
+    def test_publication_time_is_exact(self):
+        from datetime import UTC, datetime
+
+        offset = sitemaps.parse(SITEMAP_N, "CNBC")[0]
+        millis, zulu = sitemaps.parse(SITEMAP_NEWS, "Example Markets")
+
+        assert offset["published_at"] == datetime(2026, 11, 23, 14, 15, tzinfo=UTC)
+        assert millis["published_at"] == datetime(2026, 11, 23, 14, 18, 56, 615000, tzinfo=UTC)
+        assert zulu["published_at"] == datetime(2026, 11, 23, 15, 0, tzinfo=UTC)
+
+    def test_ticker_tags_are_normalised(self):
+        """US prefixes kept, indices and futures dropped, a London prefix
+        dropped, and `BRK.B` written the way Yahoo and the watchlist write it."""
+        assert sitemaps._tickers("NASDAQ:AAPL, US:MSFT, BRK.B, .SPX, @GC26Z, XLON:BA") \
+            == {"AAPL", "MSFT", "BRK-B"}
+
+    def test_a_long_ticker_list_is_not_a_match(self):
+        """Google reads five. Twelve is a market wrap, not twelve stories."""
+        twelve = ",".join(["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
+                           "TSLA", "AVGO", "JPM", "V", "MA", "COST"])
+        assert sitemaps._tickers(twelve) == set()
+
+    def test_automated_paths_are_dropped(self):
+        """`/data-news/` is MarketWatch's bot copy. The skip belongs to the
+        feed that lists it, not to every publisher."""
+        skip = {name: prefixes for name, _, prefixes in sitemaps._FEEDS}
+
+        marketwatch = sitemaps.parse(SITEMAP_NEWS, "MarketWatch", skip["MarketWatch"])
+        barrons = sitemaps.parse(SITEMAP_NEWS, "Barron's", skip["Barron's"])
+
+        assert not any("/data-news/" in a["url"] for a in marketwatch)
+        assert any("/data-news/" in a["url"] for a in barrons)
+
+    def test_an_index_or_a_bot_check_page_yields_nothing(self):
+        """Indexes are not followed. A bot check may be well-formed enough to
+        parse, so the root has to be checked as well as the parse."""
+        index = ('<?xml version="1.0"?><sitemapindex '
+                 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap>'
+                 '<loc>https://www.example-markets.com/news-1.xml</loc>'
+                 '</sitemap></sitemapindex>')
+        assert sitemaps.parse(index, "X") == []
+        assert sitemaps.parse("<html><head><title>Just a moment...</title></head>"
+                              "<body>Checking your browser</body></html>", "X") == []
+        assert sitemaps.parse("<html><body><p>Access denied<br></body></html>", "X") == []
+        assert sitemaps.parse("", "X") == []
+
+
+class TestSitemapMatching:
+    """Tags supplement the title test. They are exact where `is_relevant`'s
+    ticker path is not, and they are US symbols only."""
+
+    def test_a_ticker_tag_matches_without_the_name_in_the_title(self, monkeypatch):
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/a", "Chipmaker shares slide as export curbs bite", "NASDAQ:NVDA")))
+
+        kept = sitemaps.for_stock("NVIDIA Corporation", "NVDA")
+
+        assert kept and {a["title"] for a in kept} == {
+            "Chipmaker shares slide as export curbs bite"}
+        assert sitemaps.for_stock("Advanced Micro Devices", "AMD") == []
+
+    def test_a_one_letter_ticker_matches_the_tag_not_the_apostrophe(self, monkeypatch):
+        """The trap this avoids: `is_relevant` with the ticker finds `S` in
+        "Nvidia's", so a SentinelOne holder would get Nvidia's earnings."""
+        from services.dedup import is_relevant
+        nvidia = "Nvidia's earnings beat lifts the whole chip sector"
+        assert is_relevant(nvidia, "S", "SentinelOne Inc")
+
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/a", nvidia, "NVDA"),
+            ("/story/b", "Cybersecurity names rally on budget hopes", "NYSE:S")))
+
+        titles = {a["title"] for a in sitemaps.for_stock("SentinelOne Inc", "S")}
+        assert titles == {"Cybersecurity names rally on budget hopes"}
+
+    def test_a_non_us_listing_matches_on_name_only(self, monkeypatch):
+        """`BA` in a tag is Boeing. BAE Systems is `BA.L`, and stripping the
+        suffix would hand it every Boeing story."""
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/a", "Boeing wins a tanker order from the Air Force", "BA"),
+            ("/story/b", "BAE Systems wins a frigate contract", "")))
+
+        titles = {a["title"] for a in sitemaps.for_stock("BAE Systems plc", None)}
+        assert titles == {"BAE Systems wins a frigate contract"}
+
+    def test_one_pull_serves_every_stock(self, monkeypatch):
+        calls = []
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/a", "Chipmaker shares slide as export curbs bite", "NVDA")), calls)
+
+        for company, ticker in (("NVIDIA Corporation", "NVDA"), ("Apple Inc.", "AAPL"),
+                                ("Shell plc", None), ("Rocket Lab Corp", "RKLB")):
+            sitemaps.for_stock(company, ticker)
+
+        assert len(calls) == len(sitemaps._FEEDS)
+
+    def test_an_empty_cycle_is_cached_too(self, monkeypatch, capsys):
+        """Publishers that just failed will not answer better for stock twenty.
+        Each is named, because the yield table only sees `SITEMAPS`."""
+        calls = []
+        serve_sitemap(monkeypatch, None, calls)
+
+        assert sitemaps.for_stock("NVIDIA Corporation", "NVDA") == []
+        assert sitemaps.for_stock("Apple Inc.", "AAPL") == []
+
+        assert len(calls) == len(sitemaps._FEEDS)
+        out = capsys.readouterr().out
+        assert all(f"{name} yielded nothing" in out for name, _, _ in sitemaps._FEEDS)
+
+    def test_an_entry_past_three_days_is_dropped(self, monkeypatch):
+        """A news sitemap promises two days; MarketWatch's ran to a month."""
+        from datetime import timedelta
+
+        from normalize import now_utc
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/old", "Nvidia shares hit a record high", "NVDA"),
+            when=now_utc() - timedelta(days=4)))
+
+        assert sitemaps.for_stock("NVIDIA Corporation", "NVDA") == []
+
+
+class TestSitemapsThroughPrepare:
+    """A tag-only match never names the stock, so `prepare` would drop it as
+    off-topic. The publisher's tag is the curation that earns `related`."""
+
+    def test_a_tag_only_match_survives_prepare_as_related(self, stocked_db, monkeypatch):
+        import db
+        from services import dedup
+
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/a", "iPhone suppliers slide in Asian trading", "NASDAQ:AAPL")))
+        raw = sitemaps.for_stock("Apple", "AAPL")
+
+        prepared = dedup.prepare(raw, "AAPL", "Apple")
+
+        assert [r["relevance"] for r in prepared.rows] == ["related"]
+        # The `tickers` set on the raw article never reaches a stored row.
+        assert len(db.news.insert_news_many(prepared.rows)) == 1
+
+    def test_another_companys_headline_is_still_dropped(self, monkeypatch):
+        """The tag gets it past relevance, not past the other-company test."""
+        from services import dedup
+
+        serve_sitemap(monkeypatch, sitemap(
+            ("/story/b", "AMD Stock Jumps After a Data Center Win", "NVDA, AMD")))
+        raw = sitemaps.for_stock("NVIDIA Corporation", "NVDA")
+        assert raw
+
+        prepared = dedup.prepare(raw, "NVDA", "NVIDIA Corporation")
+
+        assert prepared.rows == []
+        assert prepared.dropped.get("other_stock") == len(raw)
+
+
+class TestSitemapsLane:
+    def test_a_london_listing_asks_the_sitemaps_too(self, temp_db, monkeypatch):
+        """Not gated: only the tag half of the match is US-only, so a London
+        line is asked with no ticker and matched on its name."""
+        import db
+        from services import news as news_pkg
+
+        asked = []
+        TestRnsGating._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.sitemaps, "for_stock",
+                            lambda *a, **kw: asked.append(a) or [])
+
+        news_pkg.collect("BAE", "BAE Systems plc", "BA.L", "LSE")
+
+        row = {r["source_type"]: r for r in db.sources.yields()}["SITEMAPS"]
+        assert row["fetches"] == 1 and row["skips"] == 0
+        assert asked == [("BAE Systems plc", None)]
+
+    def test_a_us_listing_is_asked_with_its_resolved_symbol(self, temp_db, monkeypatch):
+        """Trading212 calls Rocket Lab `6RJ0`; the publishers tag it `RKLB`."""
+        from services import news as news_pkg
+
+        asked = []
+        TestRnsGating._quiet(monkeypatch)
+        monkeypatch.setattr(news_pkg.sitemaps, "for_stock",
+                            lambda *a, **kw: asked.append(a) or [])
+
+        news_pkg.collect("6RJ0", "Rocket Lab Corp", "RKLB", "NMS")
+
+        assert asked == [("Rocket Lab Corp", "RKLB")]
+
+    def test_sitemaps_wait_for_the_hourly_lane(self):
+        """The fast lane runs without event detection, and `events.detect`
+        only sees the inserting refresh's ids — a row the fast lane stored
+        would never be judged. A write-up is not a minutes-matter item anyway."""
+        from services import news as news_pkg
+        assert sitemaps.SOURCE_TYPE not in news_pkg.FAST_SOURCES
