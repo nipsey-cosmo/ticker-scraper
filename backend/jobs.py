@@ -47,7 +47,9 @@ def refresh_prices() -> dict:
 
     ponytail: bars, splits and dividends are hourly, so in session the chart's
     last bar can trail the live quote by up to an hour, and a split's history
-    rescale can trail the post-split quote as long. Shorten
+    rescale can trail the post-split quote as long. "An hour" is 60 or 65
+    minutes: the pass is due on the first five-minute tick at or past the
+    hour, and a tick that lands a millisecond early waits for the next. Shorten
     PRICE_REFRESH_MINUTES if that ever shows.
     """
     global _last_price_refresh
@@ -183,7 +185,12 @@ def catch_up() -> dict:
 def refresh_all() -> dict:
     """Manual full refresh, exposed on POST /refresh."""
     return {
-        "prices": refresh_prices(),
+        # Not refresh_prices() while a market is open. Off the hour that tick
+        # only walks stale quotes, and whoever pressed refresh wants the bars,
+        # splits and dividends too. Shut, the hourly gate still applies: the
+        # price cannot move, so a second press has nothing new to fetch.
+        "prices": (prices.refresh_watchlist(range_="5d") if markets_open()
+                   else refresh_prices()),
         "intraday": refresh_intraday(),
         "news": refresh_news(),
         "sentiment_days": aggregate_sentiment(),

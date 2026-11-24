@@ -17,8 +17,9 @@ five-minute chain. The costs of the split, stated rather than hidden: today's
 daily bar is refreshed hourly, so in session the chart's last point can trail
 the header price by up to an hour, and a split's rescale of stored history can
 trail the post-split quote by as long. Every quote write also fires the
-`stocks` change notification, so open browser tabs re-fetch once a minute
-during a session.
+`stocks` change notification, so open browser tabs re-fetch each minute during
+a session — twice when prices moved, because the snapshots and the quotes
+commit separately and land in two notification windows.
 
 History has its own fallback, because the chain above does not cover it: only
 Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the

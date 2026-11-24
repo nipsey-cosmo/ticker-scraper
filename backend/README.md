@@ -181,7 +181,8 @@ before spark was added. Today's daily bar is refreshed hourly, so in session
 the chart's last point can trail the live header price by up to an hour, and a
 split's rescale of stored history can trail the post-split quote by as long.
 Each quote write fires the change notification, so open browser tabs re-fetch
-once a minute during a session. And the gain is the one-minute price, not lower
+each minute during a session, and twice when prices moved, because the
+snapshots and the quotes commit separately. And the gain is the one-minute price, not lower
 load: with 11 followed stocks an open hour costs 203 requests instead of 264,
 but below about six followed stocks it costs more than before.
 

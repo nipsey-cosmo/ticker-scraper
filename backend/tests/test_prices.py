@@ -1135,6 +1135,42 @@ class TestPriceCadence:
         assert calls[0] == calls[12] == {"range_": "5d"}
         assert calls[1:12] == [{"stale_only": True}] * 11
 
+    def test_a_manual_refresh_in_session_is_always_the_full_pass(self, monkeypatch):
+        """POST /refresh must not inherit the tick's stale-only shortcut: off
+        the hour that would skip bars, splits and dividends, which is exactly
+        what somebody pressing refresh is asking for."""
+        import jobs
+
+        now = self._clock(monkeypatch, 10_000.0)
+        calls = self._passes(monkeypatch)
+        monkeypatch.setattr(jobs, "markets_open", lambda: True)
+        for other in ("refresh_intraday", "refresh_news", "aggregate_sentiment",
+                      "refresh_earnings", "refresh_social"):
+            monkeypatch.setattr(jobs, other, lambda: None)
+
+        jobs.refresh_prices()                  # the hourly pass has just run
+        now[0] += 300
+        jobs.refresh_all()
+
+        assert calls == [{"range_": "5d"}, {"range_": "5d"}]
+
+    def test_a_manual_refresh_on_a_shut_market_keeps_the_hourly_gate(self, monkeypatch):
+        import jobs
+
+        now = self._clock(monkeypatch, 10_000.0)
+        calls = self._passes(monkeypatch)
+        monkeypatch.setattr(jobs, "markets_open", lambda: False)
+        for other in ("refresh_intraday", "refresh_news", "aggregate_sentiment",
+                      "refresh_earnings", "refresh_social"):
+            monkeypatch.setattr(jobs, other, lambda: None)
+
+        jobs.refresh_prices()
+        now[0] += 300
+        result = jobs.refresh_all()
+
+        assert result["prices"]["skipped"] == "markets closed"
+        assert calls == [{"range_": "5d"}]
+
     def test_an_open_tick_only_walks_stale_quotes(self, stocked_db, monkeypatch):
         """Spark keeps AAPL fresh; 6RJ0 has never been quoted. If spark then
         fails outright, every quote goes stale and every stock falls back."""
