@@ -1,12 +1,14 @@
 """News collection: fan out to every source, merge, dedupe, store, score.
 
-Seven fetches across five independent operators, so no single company's outage
-or rate limit can take the feed down:
+Eleven sources across fourteen independent operators, so no single company's
+outage or rate limit can take the feed down. Up to ten are asked for a US
+listing and seven for any other:
 
     SEC EDGAR     the filing itself, before anyone reports on it (US, opt-in)
     EDGAR search  filings by *other* companies that name this one (US, opt-in)
     RNS           UK regulatory announcements — EDGAR's opposite number (non-US)
     Newswires     the company's own release, which every article rewrites
+    Sitemaps      five publishers' Google News files, with their own ticker tags
     Finviz        real publisher URLs, dense US coverage
     Yahoo search  thumbnails — the only free image source that costs no request
     Yahoo RSS     summaries
@@ -14,9 +16,9 @@ or rate limit can take the feed down:
     Bing News     a second search index, unwrapped to real publisher URLs
     Google News   the broadest reach, and the only one that can backfill a month
 
-Spreading the load this way is also the point: seven polite fetches across five
-operators is far kinder to each of them than hammering one supplier, and it
-needs no proxy or IP rotation to stay welcome.
+Spreading the load this way is also the point: a polite request or two to each
+of fourteen operators is far kinder to each of them than hammering one
+supplier, and it needs no proxy or IP rotation to stay welcome.
 
 GDELT was tried here and removed. Its global index sounds like the obvious way
 to cover non-US listings, but the phrase search is too loose to use: `"shell"`
@@ -29,8 +31,8 @@ Bing already supplies the non-US reach it was added for.
 
 They are queried concurrently and merged, so a source going dark degrades
 coverage instead of breaking the refresh. If every source returns nothing, that
-genuinely means there is no news, not that a scraper broke — because five
-independent things would have had to break at once.
+genuinely means there is no news, not that a scraper broke — because at least
+eleven independent operators would have had to break at once.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ from normalize import days_ago_iso
 
 from .. import dedup, events, sentiment_service, symbols
 from . import (bing_news, extract, finviz, google_news, images, nasdaq_news,
-               rns, sec_edgar, wires, yahoo_news)
+               rns, sec_edgar, sitemaps, wires, yahoo_news)
 
 __all__ = ["collect", "refresh", "backfill", "refresh_watchlist", "images",
            "FAST_SOURCES"]
@@ -86,6 +88,13 @@ def collect(short_name: str, company_name: str, yahoo_symbol: str | None,
     tasks.append((wires.SOURCE_TYPE,
                   lambda: wires.for_stock(short_name, company_name,
                                           _alias_tuple(yahoo_symbol))))
+
+    # The publisher sitemaps: also one shared pull, also asked for every
+    # stock. Only the ticker-tag half of the match is US-only — a tagged `BA`
+    # is Boeing, so BAE's `BA.L` is matched on its name and nothing else.
+    tasks.append((sitemaps.SOURCE_TYPE,
+                  lambda: sitemaps.for_stock(
+                      company_name, us_ticker if symbols.is_us_listing(exchange) else None)))
 
     # Finviz, Nasdaq and EDGAR only carry US listings.
     if symbols.is_us_listing(exchange):

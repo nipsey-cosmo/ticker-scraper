@@ -100,10 +100,11 @@ another source.
 
 ### News
 
-Seven fetches across five independent operators, queried concurrently, merged
-and deduplicated, so no single company's outage takes the feed down. Spreading
-the work is also what keeps it welcome: seven polite fetches across five
-operators is far kinder to each than hammering one.
+Eleven sources across fourteen independent operators (up to ten asked for a US
+listing, seven for any other), queried concurrently, merged and deduplicated,
+so no single company's outage takes the feed down. Spreading the work is also
+what keeps it welcome: a polite request or two to each of fourteen operators is
+far kinder to each than hammering one.
 
 | Source | Why it's there | Caveat |
 |---|---|---|
@@ -114,6 +115,7 @@ operators is far kinder to each than hammering one.
 | Finviz quote page | Real publisher URLs, genuinely curated per ticker | US listings only |
 | Nasdaq per-ticker RSS | Wire copy and editorial, on a host nothing else here touches | US only; returns generic news for unknown symbols, so it isn't trusted for `related` |
 | SEC EDGAR Atom | The filing itself, so the 8-K lands here before anyone reports on it | US only, opt-in |
+| Publisher news sitemaps | MarketWatch, Barron's, Benzinga, Seeking Alpha and The Market Reporter, one fetch each for the whole watchlist, with exact publish times and the publisher's own ticker tags | Ticker tags are US only; a tag-only match is stored as `related` |
 
 **Bing needs a different query.** Google's
 `"Company" OR "TICK stock" OR "TICK shares"` returns a full feed there and an
@@ -498,7 +500,9 @@ can never produce a wrong price, only a redundant request.
 
 Depth is best on US listings, since Finviz, Nasdaq and EDGAR are US only. A
 German or London line is covered by Google, Yahoo and Bing, and for thin non-US
-tickers Bing is often the only one returning anything.
+tickers Bing is often the only one returning anything. The publisher sitemaps
+barely change that: four of the five are US newsrooms, and their ticker tags
+are US symbols, so a non-US line only matches a headline that names it.
 
 ## License
 

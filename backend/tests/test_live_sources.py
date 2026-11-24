@@ -25,7 +25,7 @@ import pytest
 import settings
 from services import calendar, prices, social, stooq, yahoo
 from services.news import (bing_news, finviz, google_news, nasdaq_news,
-                           rns, sec_edgar, wires, yahoo_news)
+                           rns, sec_edgar, sitemaps, wires, yahoo_news)
 
 # Liquid, US-listed, and covered by everything. A quiet ticker would make an
 # empty result ambiguous, which is exactly what these tests exist to avoid.
@@ -99,6 +99,34 @@ class TestNewsSources:
             _plausible(rns.fetch(), "rns")
         finally:
             rns.reset_cache()
+
+    def test_sitemaps(self):
+        """Per feed, not the merged `fetch`: one dead publisher would hide
+        behind the other four. A news sitemap promises the last two days, so a
+        newest entry older than that means the file has stopped updating —
+        which is how CNBC's was found and left out.
+
+        All feeds are read before anything is asserted, so one failure still
+        reports on the rest.
+        """
+        from datetime import timedelta
+
+        from normalize import now_utc
+
+        problems = []
+        for name, url, skip in sitemaps._FEEDS:
+            response = sitemaps.scraper.get(url)
+            articles = (sitemaps.parse(response.text, name, skip)
+                        if response and response.ok else [])
+            dated = [a["published_at"] for a in articles if a["published_at"]]
+            if not dated or not str(articles[0]["url"]).startswith("http"):
+                problems.append(f"{name}: nothing plausible")
+                continue
+            age = now_utc() - max(dated)
+            print(f"[live] {name}: {len(articles)} entries, newest {age} old")
+            if age > timedelta(hours=48):
+                problems.append(f"{name}: newest entry is {age} old")
+        assert not problems, problems
 
 
 @pytest.mark.live
