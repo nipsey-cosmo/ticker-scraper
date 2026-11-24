@@ -891,6 +891,10 @@ class TestSitemapParsing:
                            "TSLA", "AVGO", "JPM", "V", "MA", "COST"])
         assert sitemaps._tickers(twelve) == set()
 
+    def test_a_space_after_the_exchange_is_still_the_same_tag(self):
+        """"NYSE: S" used to come out as " S", which matches no stock."""
+        assert sitemaps._tickers("NYSE: S, NASDAQ : AAPL") == {"S", "AAPL"}
+
     def test_automated_paths_are_dropped(self):
         """`/data-news/` is MarketWatch's bot copy. The skip belongs to the
         feed that lists it, not to every publisher."""
@@ -977,6 +981,28 @@ class TestSitemapMatching:
         assert len(calls) == len(sitemaps._FEEDS)
         out = capsys.readouterr().out
         assert all(f"{name} yielded nothing" in out for name, _, _ in sitemaps._FEEDS)
+
+    def test_a_bad_address_costs_one_entry_not_the_pull(self, monkeypatch):
+        """`urlsplit` raises on a malformed address. Uncaught, that failed the
+        pull for every publisher and every stock — and a failed pull is never
+        cached, so each stock asked again. A relative or `javascript:` address
+        goes the same way: it is stored and linked to, so it must be real."""
+        body = sitemap(("/story/a", "Nvidia shares hit a record high", "NVDA"),
+                       ("/story/b", "Nvidia wins a second supercomputer order", "NVDA"),
+                       ("/story/c", "Nvidia opens a research lab in Taiwan", "NVDA"),
+                       ("/story/d", "Nvidia names a new finance chief", "NVDA"))
+        for path, address in (("/story/b", "https://[bad/story"),
+                              ("/story/c", "/story/c"),
+                              ("/story/d", "javascript:alert(1)")):
+            body = body.replace(f"https://www.example-markets.com{path}", address)
+        calls = []
+        serve_sitemap(monkeypatch, body, calls)
+
+        kept = sitemaps.for_stock("NVIDIA Corporation", "NVDA")
+        sitemaps.for_stock("Apple Inc.", "AAPL")
+
+        assert {a["url"] for a in kept} == {"https://www.example-markets.com/story/a"}
+        assert len(calls) == len(sitemaps._FEEDS)
 
     def test_an_entry_past_three_days_is_dropped(self, monkeypatch):
         """A news sitemap promises two days; MarketWatch's ran to a month."""

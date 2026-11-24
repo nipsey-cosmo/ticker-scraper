@@ -153,7 +153,8 @@ def parse(xml: str, source: str, skip: tuple[str, ...] = ()) -> list[dict]:
     for entry in root:
         parts = {_local(child.tag): child for child in entry}
         loc = (parts["loc"].text or "").strip() if "loc" in parts else ""
-        if not loc or "news" not in parts or urlsplit(loc).path.startswith(skip):
+        path = _article_path(loc)
+        if path is None or "news" not in parts or path.startswith(skip):
             continue
 
         news = {_local(el.tag): (el.text or "").strip() for el in parts["news"].iter()}
@@ -191,10 +192,30 @@ def _tickers(raw: str | None) -> set[str]:
         if not token[:1].isalnum():
             continue
         prefix, _, symbol = token.rpartition(":")
+        # "NYSE: S" is the same tag as "NYSE:S". Unstripped it became " S",
+        # which matches no stock.
+        prefix, symbol = prefix.strip(), symbol.strip()
         if symbol and (not prefix or prefix in _US_PREFIXES):
             symbols.add(symbol.replace(".", "-").replace("/", "-"))
     symbols -= _NOT_LISTINGS
     return symbols if len(symbols) <= _MAX_TICKERS else set()
+
+
+def _article_path(loc: str) -> str | None:
+    """The path of an http(s) article address, or None for anything else.
+
+    A bad `<loc>` must cost its own entry and nothing more. `urlsplit` raises
+    on `https://[bad`, and a raise here escaped `parse` and then `fetch`: one
+    malformed address in one publisher's file lost all five for every stock,
+    and because the failed pull was never cached, every stock asked again.
+    A relative or `javascript:` address is dropped too: the URL is stored,
+    linked to and fetched, so it has to be a real one.
+    """
+    try:
+        parts = urlsplit(loc)
+    except ValueError:
+        return None
+    return parts.path if parts.scheme in ("http", "https") and parts.netloc else None
 
 
 def _local(tag: str) -> str:
