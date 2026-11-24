@@ -2,8 +2,11 @@
 
 These are the public JSON endpoints a browser hits, so no key and no crumb
 dance. The chart endpoint is the workhorse: one call returns the live quote
-*and* the historical series, which is why there is no separate bulk-quote path
-to keep working. Fewer code paths, more data per request.
+*and* the historical series for one symbol. Spark is the bulk-quote path beside
+it — twenty symbols per request, so a one-minute quote does not cost a chart
+call per stock per minute. It is undocumented, which is why nothing depends on
+it alone: the chart chain in services/prices.py still covers every quote it
+misses.
 
 The one non-JSON payload is the price stream's tick (`parse_pricing`), which
 services/stream.py reads off Yahoo's WebSocket.
@@ -187,6 +190,52 @@ def parse_chart(data: dict) -> dict | None:
         "dividends": dividends,
         "splits": splits,
     }
+
+
+# Spark answers twenty symbols per request; a twenty-first fails the whole
+# request with a 400 rather than truncating.
+_SPARK_CHUNK = 20
+
+
+def spark(symbols: list[str]) -> dict[str, dict]:
+    """Live quotes for many symbols, keyed by Yahoo symbol. Missing = no quote.
+
+    Each result node is shaped exactly like a chart result, so parse_chart
+    reads it unchanged; only the quote fields are meant to be used. The points
+    are a close-only 5m series and are no substitute for daily bars.
+
+    Results come back in no fixed order and an unknown symbol is silently left
+    out, so everything is keyed by the symbol the entry names, never by
+    position. `range=1d&interval=5m` is what makes `previousClose` the prior
+    session's close; an entry without it is dropped, since parse_chart would
+    otherwise fall back to the prior *5m bar* and store a five-minute move as
+    the day's change.
+    """
+    out: dict[str, dict] = {}
+    for start in range(0, len(symbols), _SPARK_CHUNK):
+        chunk = symbols[start:start + _SPARK_CHUNK]
+        data = _try_hosts(
+            _CHART_HOSTS, "/v7/finance/spark",
+            {"symbols": ",".join(chunk), "range": "1d", "interval": "5m"},
+            cache=False,
+        )
+        if not data:
+            continue                                   # costs only this chunk
+        for entry in (data.get("spark") or {}).get("result") or []:
+            try:
+                symbol, nodes = entry["symbol"], entry["response"]
+                if nodes[0]["meta"].get("previousClose") is None:
+                    continue
+            except (KeyError, IndexError, TypeError, AttributeError):
+                continue
+            parsed = parse_chart({"chart": {"result": nodes}})
+            if parsed:
+                out[symbol] = parsed
+                # Same as chart(): the stream learns a new follow's divisor
+                # from whichever call names the symbol first, and spark names
+                # it within a minute where the chart pass can take an hour.
+                minor_units[symbol] = parsed["divisor"]
+    return out
 
 
 def _regular_session(meta: dict) -> dict | None:

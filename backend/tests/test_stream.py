@@ -180,6 +180,17 @@ class TestDecode:
         yahoo.chart("SHEL.L")
         assert yahoo.minor_units == {"SHEL.L": 100.0}
 
+    def test_spark_records_the_divisor_too(self, monkeypatch):
+        """A new follow is named by spark within a minute; waiting for the
+        hourly chart pass would keep it off the stream that long."""
+        from tests.test_prices import spark_entry, spark_payload
+        monkeypatch.setattr(yahoo, "minor_units", {})
+        payload = spark_payload(spark_entry("SHEL.L", currency="GBp"),
+                                spark_entry("AAPL"))
+        monkeypatch.setattr(yahoo, "_try_hosts", lambda *a, **kw: payload)
+        yahoo.spark(["SHEL.L", "AAPL"])
+        assert yahoo.minor_units == {"SHEL.L": 100.0, "AAPL": 1.0}
+
 
 # ── One session ──────────────────────────────────────────────────────────
 

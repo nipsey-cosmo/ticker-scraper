@@ -16,16 +16,28 @@ from services import stream
 
 scheduler = BlockingScheduler(timezone="UTC")
 
-# Prices on the fast cadence. `jobs.refresh_prices` makes one tick an hour a
-# full pass; the rest poll only stocks the price stream (started in main) is
-# not keeping fresh, and do nothing at all once every market is shut.
+# Batch quotes every minute; the job returns at once whenever every market is
+# shut, so it buys a one-minute price in session without scraping all night.
+# Beneath the price stream (started in main) it is the gap-filler: the stocks
+# the stream does not feed, and all of them while the socket is down.
+scheduler.add_job(
+    jobs.refresh_quotes, "interval",
+    minutes=settings.QUOTE_REFRESH_MINUTES, id="quotes",
+    max_instances=1, coalesce=True,
+)
+
+# The chart chain on a five-minute tick: the full pass (daily bars, splits,
+# dividends) once an hour, and in between, during a session, only the quotes
+# that neither the stream nor the spark job kept fresh. Shut, the in-between
+# ticks do nothing.
 scheduler.add_job(
     jobs.refresh_prices, "interval",
     minutes=settings.PRICE_REFRESH_OPEN_MINUTES, id="prices",
     max_instances=1, coalesce=True,
 )
 
-# Intraday bars ride the same fast cadence as the quote, and skip themselves
+# Intraday bars stay on the five-minute tick (spark's 5m series is close-only,
+# no volume or OHLC, so it cannot stand in for them) and skip themselves
 # outside session hours. Attribution rides along with them.
 scheduler.add_job(
     jobs.refresh_intraday, "interval",
@@ -69,10 +81,11 @@ scheduler.add_job(
 def main() -> None:
     db.create_tables()
     print(f"[scheduler] live quotes from the Yahoo stream, flushed every "
-          f"{stream.FLUSH_SECONDS}s; prices polled every "
-          f"{settings.PRICE_REFRESH_OPEN_MINUTES}m while a market is open for "
-          f"stocks the stream is not feeding, full pass every "
-          f"{settings.PRICE_REFRESH_MINUTES}m; news every {settings.NEWS_REFRESH_MINUTES}m "
+          f"{stream.FLUSH_SECONDS}s; batch quotes every "
+          f"{settings.QUOTE_REFRESH_MINUTES}m while a market is open (stale ones "
+          f"re-checked every {settings.PRICE_REFRESH_OPEN_MINUTES}m), "
+          f"full price pass every {settings.PRICE_REFRESH_MINUTES}m, "
+          f"news every {settings.NEWS_REFRESH_MINUTES}m "
           f"(filings every {settings.NEWS_FAST_MINUTES}m)")
 
     # Bring everything current on start rather than idling until the first tick.

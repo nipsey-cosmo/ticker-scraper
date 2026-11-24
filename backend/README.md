@@ -180,8 +180,9 @@ The poll stays as the fallback, through the database rather than any signal
 from the stream. The scheduler ticks every five minutes; once an hour the tick
 is a full pass over every stock (daily bars, splits, dividends, snapshots), and
 in between it refreshes only stocks whose quote is more than two minutes old. A
-dead or mute stream therefore needs no detection: its quotes age and the
-five-minute poll takes them back. Once every market is shut the in-between
+dead or mute stream therefore needs no detection: its quotes age, spark keeps
+them to the minute, and if spark is gone too the five-minute poll takes them
+back. Once every market is shut the in-between
 ticks do nothing at all, since a closed market's price cannot move.
 
 Ticks are dropped rather than stored when they are extended-hours (only an
@@ -196,7 +197,17 @@ flag still set, and storing one would stamp an old price as fresh. Half an
 hour, not a minute, because a delayed exchange streams late by design (Tokyo
 ticks arrive 15 minutes old, the same price the chart serves).
 
-What the stream costs, honestly:
+**Under the stream, Yahoo's spark endpoint quotes every followed stock each
+minute** while a market is open: one request per twenty stocks, quote and hourly
+snapshot only. It is the gap-filler for whatever the stream does not feed
+(minor-unit lines, a stock still waiting for its divisor, every stock while the
+socket is down). Spark is undocumented; if it disappears, those quotes go stale
+and the five-minute chain takes over, which is exactly the behaviour before
+either was added. Once every market is shut only the hourly pass runs: a closed
+market's price cannot move, so polling it is load on someone else's servers for
+an unchanged number.
+
+What this costs, honestly:
 
 - Each five-second write fires the `stocks` change notification, so open
   browser tabs re-fetch every five seconds where they did every five minutes.
@@ -205,12 +216,18 @@ What the stream costs, honestly:
   stops, since that ticks around the clock. `stream.FLUSH_SECONDS` is the knob.
 - Today's daily bar lags up to an hour for a streamed stock, since only the
   hourly pass writes bars for it.
-- A newly followed stock waits for its first chart call in the scheduler
-  process to learn its divisor before it streams: up to five minutes while a
-  market is open, up to an hour once every market is shut. The backfill a
-  follow triggers does not count, because it runs in the API process.
-- The 5m intraday job is untouched, so Yahoo requests per stock-hour fall from
-  24 to about 13, not to 1.
+- A newly followed stock waits for its first spark or chart call in the
+  scheduler process to learn its divisor before it streams: up to a minute
+  while a market is open, up to an hour once every market is shut. The backfill
+  a follow triggers does not count, because it runs in the API process.
+- The stream buys freshness, not load. With spark beneath it an open hour
+  costs the same 203 requests for 11 followed stocks as spark alone (264
+  before either), and below about six followed stocks it costs more than
+  before.
+- A spark pass also fires the change notification each minute, twice when
+  prices moved, because the snapshots and the quotes commit separately.
+- A split's rescale of stored history can trail the post-split quote by up
+  to an hour.
 - Not yet verified: that pre-market ticks arrive with the session flag absent,
   that the connection holds for hours, any cap on symbols per connection, and
   that every exchange streams. One that does not stays on the poll.
@@ -484,8 +501,9 @@ Everything has a working default. No key is required.
 | `STOCKY_HOST` / `STOCKY_PORT` | `127.0.0.1` / `5000` | Bind address |
 | `STOCKY_CORS_ORIGINS` | localhost 3000/4173/5173/8080 | Allow-list |
 | `STOCKY_BACKFILL_DAYS` | `30` | History pulled for a new follow |
-| `STOCKY_PRICE_REFRESH_OPEN_MINUTES` | `5` | Price cadence while a market is in session |
-| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Full price pass interval, and the only price cadence once every market is shut |
+| `STOCKY_QUOTE_REFRESH_MINUTES` | `1` | Spark batch-quote cadence while a market is in session |
+| `STOCKY_PRICE_REFRESH_OPEN_MINUTES` | `5` | Chart-chain tick in session, for quotes the stream and spark left stale; also the intraday-bar cadence |
+| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Full chart pass (daily bars, splits, dividends), open or shut |
 | `STOCKY_QUOTE_STALE_MINUTES` | `15` | Serve a stored quote under this age, refresh behind the response |
 | `STOCKY_NEWS_REFRESH_MINUTES` | `60` | News cadence |
 | `STOCKY_SENTIMENT` | `vader` | `vader` or `finbert` |
@@ -502,7 +520,8 @@ and are set from the UI or `PUT /config`.
 | Job | Schedule | What it does |
 |---|---|---|
 | price stream | Continuous, a thread in the scheduler process | Live quotes for followed stocks, written every 5s in session |
-| `refresh_prices` | Hourly full pass; every 5m while a market is open, for stocks the stream left over 2 minutes stale | Quotes and recent bars, concurrently |
+| `refresh_quotes` | 1m while a market is open | Spark batch quotes, quote only |
+| `refresh_prices` | Hourly, plus 5m while a market is open | Full pass hourly: quotes, daily bars, splits, dividends. In between, the chain for stale quotes only |
 | `refresh_news` | Hourly | New articles, images, sentiment, impact grading |
 | `aggregate_sentiment` | Daily 22:00 UTC | Rebuild daily rollups |
 | `prune` | Daily 03:30 UTC | Retention |

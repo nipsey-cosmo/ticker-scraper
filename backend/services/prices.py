@@ -1,19 +1,41 @@
 """Prices, free of charge, with a real fallback chain.
 
+While a market is open, quotes arrive three ways, freshest first:
+
     0. Yahoo stream    — services/stream.py, quote row only, seconds old
+    0. Yahoo spark     — one request per twenty stocks, every minute, quote only
+
+and beneath both sits the per-stock chain, walked every five minutes for any
+quote the two above have left stale and hourly for every stock, because only
+the chart call brings daily bars, splits and dividends:
+
     1. Yahoo chart v8  — quote *and* daily history in one request, two hosts
     2. Nasdaq quote    — US listings, real-time during the session, own host
     3. CNBC quote API  — independent host, no key, global coverage
 
 The stream sits above the chain rather than in it. It is a long-lived socket in
 the scheduler process that writes the latest regular-session tick for every
-followed stock it can price; the poll below then skips any stock whose quote is
-fresher than QUOTE_FRESH_SECONDS. Nothing tells the poll the stream is down —
-a dead stream's quotes simply age past the threshold and the five-minute poll
-takes them back. The hourly full pass ignores freshness, so daily bars, splits,
-dividends and snapshots keep arriving for streamed stocks too, which also
-means today's daily bar lags up to an hour for them. Minor-unit listings
-(pence, cents) are not streamed yet; see the ponytail in stream._session.
+followed stock it can price. Spark (`refresh_watchlist_quotes`) is the
+gap-filler under it: the stocks the stream does not feed — minor-unit listings
+(pence, cents) are not streamed yet, see the ponytail in stream._session — and
+every stock while the socket is down. It writes the quote and nothing else; its
+series is a close-only 5m line, not daily bars. Both are undocumented, so
+nothing relies on either alone.
+
+Nothing tells the poll that the stream or spark is down. A quote that neither
+is feeding simply ages past two spark intervals and the five-minute chain takes
+it back, at exactly the attempt rate from before either existed. The hourly
+full pass ignores freshness, so daily bars, splits, dividends and snapshots
+keep arriving for every stock.
+
+The costs of the split, stated rather than hidden: today's daily bar is
+refreshed hourly, so in session the chart's last point can trail the header
+price by up to an hour, and a split's rescale of stored history can trail the
+post-split quote by as long. Every quote write also fires the `stocks` change
+notification, so open browser tabs re-fetch on every stream flush during a
+session, and on each spark pass too — twice when prices moved, because the
+snapshots and the quotes commit separately and land in two notification
+windows.
 
 History has its own fallback, because the chain above does not cover it: only
 Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
@@ -494,14 +516,57 @@ def refresh_watchlist_intraday() -> dict:
     return {"stored": stored}
 
 
-# A quote younger than this is being kept current by the price stream, so the
-# fast poll leaves it alone. Comfortably more than one stream flush (5 s) plus
-# a scheduler tick's jitter, and well under the five-minute poll it defers to.
-QUOTE_FRESH_SECONDS = 120
+def refresh_watchlist_quotes() -> dict:
+    """Scheduled, every minute: spark quotes for every followed stock.
+
+    Quote only — the `stocks` row and the hourly snapshot. Never `_store`,
+    which would file spark's 5m closes as daily bars. The quote lands on the
+    stock's own short name, not the Yahoo symbol: `6RJ0` is quoted as `RKLB`,
+    and several short names can share one Yahoo symbol.
+
+    No fallback in here on purpose. A symbol spark cannot answer would be
+    retried every minute; instead its quote goes stale and the five-minute
+    stale-only pass in jobs.refresh_prices walks the chain for it. Stocks not
+    yet resolved to a Yahoo symbol are skipped for the same reason — that pass
+    resolves them.
+    """
+    if not markets_open():
+        return {"skipped": "markets closed"}
+
+    names_by_symbol: dict[str, list[str]] = {}
+    for row in db.watchlist.get_watchlist():
+        if row.get("yahoo_symbol"):
+            names_by_symbol.setdefault(row["yahoo_symbol"], []).append(row["short_name"])
+    if not names_by_symbol:
+        return {"updated": []}
+
+    rows = []
+    for symbol, quote in yahoo.spark(list(names_by_symbol)).items():
+        for short_name in names_by_symbol.get(symbol, []):
+            _store_snapshot(short_name, quote["price"])
+            rows.append({
+                "short_name": short_name,
+                "price": quote["price"],
+                "change": quote.get("change"),
+                "change_percent": quote.get("change_percent"),
+                "currency": quote.get("currency"),
+            })
+    db.stocks.bulk_set_quotes(rows)
+
+    updated = [r["short_name"] for r in rows]
+    print(f"[prices] spark quoted {len(updated)} of "
+          f"{sum(map(len, names_by_symbol.values()))}")
+    return {"updated": updated}
 
 
 def refresh_watchlist(range_: str = "5d", stale_only: bool = False) -> dict:
-    """Scheduled job: refresh every followed stock, concurrently.
+    """Scheduled job: walk the chain for followed stocks, concurrently.
+
+    Every followed stock by default — the hourly pass that brings daily bars,
+    splits and dividends. `stale_only` narrows it to stocks whose quote is
+    older than two spark intervals, which is the fallback for whatever spark
+    missed: if spark fails wholesale, every quote goes stale and this is the
+    old five-minute chain at the old attempt rate.
 
     Sequentially this took one full chain-walk per stock, so a twenty-stock
     watchlist was minutes behind the market by the time it finished — the
@@ -509,17 +574,16 @@ def refresh_watchlist(range_: str = "5d", stale_only: bool = False) -> dict:
     pace each source, so this parallelises across stocks without hitting any
     one source harder than the sequential version did.
 
-    `stale_only` skips every stock whose quote is under QUOTE_FRESH_SECONDS
-    old, which in practice means the ones the stream is feeding. A stock with
-    no quote at all counts as stale. Database age rather than asking the
-    stream thread is the point: it needs no shared state, and a stream that
-    dies hands its stocks back simply by going quiet.
+    Staleness is read from the database rather than asked of the stream thread
+    or the spark job, and that is the point: it needs no shared state, and a
+    source that dies hands its stocks back simply by going quiet.
     """
     if stale_only:
+        cutoff = to_iso(now_utc() - timedelta(minutes=2 * settings.QUOTE_REFRESH_MINUTES))
         # price_updated_at is canonical ISO, so string order is time order.
-        cutoff = to_iso(now_utc() - timedelta(seconds=QUOTE_FRESH_SECONDS))
+        # A stock never quoted has none and compares as "" — stale.
         watched = [row["short_name"] for row in db.watchlist.get_watchlist()
-                   if (row["price_updated_at"] or "") < cutoff]
+                   if (row.get("price_updated_at") or "") < cutoff]
     else:
         watched = db.watchlist.get_symbols()
     if not watched:
