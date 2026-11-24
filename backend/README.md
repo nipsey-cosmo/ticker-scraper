@@ -167,9 +167,24 @@ source agrees with.
 History comes from Yahoo only. If Yahoo is unavailable the quote still updates
 from a fallback and stored history stops extending: degraded, not broken.
 
-The scheduler ticks every five minutes but `jobs.refresh_prices` drops most of
-those back to hourly once every market is shut. A closed market's price cannot
-move, so polling it is load on someone else's servers for an unchanged number.
+While a market is open, the quote comes from Yahoo's spark endpoint every
+minute: one request per twenty followed stocks, quote only. The chain above
+runs beneath it on a five-minute tick, but only for stocks whose quote spark
+has left more than two minutes stale, and once an hour for every stock, since
+only the chart call brings daily bars, splits and dividends. Once every market
+is shut only the hourly pass runs: a closed market's price cannot move, so
+polling it is load on someone else's servers for an unchanged number.
+
+The trade-offs, plainly. Spark is undocumented; if it disappears, every quote
+goes stale and the five-minute chain takes over, which is exactly the behaviour
+before spark was added. Today's daily bar is refreshed hourly, so in session
+the chart's last point can trail the live header price by up to an hour, and a
+split's rescale of stored history can trail the post-split quote by as long.
+Each quote write fires the change notification, so open browser tabs re-fetch
+each minute during a session, and twice when prices moved, because the
+snapshots and the quotes commit separately. And the gain is the one-minute price, not lower
+load: with 11 followed stocks an open hour costs 203 requests instead of 264,
+but below about six followed stocks it costs more than before.
 
 ## The instrument catalogue
 
@@ -440,8 +455,9 @@ Everything has a working default. No key is required.
 | `STOCKY_HOST` / `STOCKY_PORT` | `127.0.0.1` / `5000` | Bind address |
 | `STOCKY_CORS_ORIGINS` | localhost 3000/4173/5173/8080 | Allow-list |
 | `STOCKY_BACKFILL_DAYS` | `30` | History pulled for a new follow |
-| `STOCKY_PRICE_REFRESH_OPEN_MINUTES` | `5` | Price cadence while a market is in session |
-| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Price cadence once every market is shut |
+| `STOCKY_QUOTE_REFRESH_MINUTES` | `1` | Spark batch-quote cadence while a market is in session |
+| `STOCKY_PRICE_REFRESH_OPEN_MINUTES` | `5` | Chart-chain tick in session, for quotes spark left stale; also the intraday-bar cadence |
+| `STOCKY_PRICE_REFRESH_MINUTES` | `60` | Full chart pass (daily bars, splits, dividends), open or shut |
 | `STOCKY_QUOTE_STALE_MINUTES` | `15` | Serve a stored quote under this age, refresh behind the response |
 | `STOCKY_NEWS_REFRESH_MINUTES` | `60` | News cadence |
 | `STOCKY_SENTIMENT` | `vader` | `vader` or `finbert` |
@@ -457,7 +473,8 @@ and are set from the UI or `PUT /config`.
 
 | Job | Schedule | What it does |
 |---|---|---|
-| `refresh_prices` | 5m while a market is open, hourly otherwise | Quotes and recent bars, concurrently |
+| `refresh_quotes` | 1m while a market is open | Spark batch quotes, quote only |
+| `refresh_prices` | Hourly, plus 5m while a market is open | Full pass hourly: quotes, daily bars, splits, dividends. In between, the chain for stale quotes only |
 | `refresh_news` | Hourly | New articles, images, sentiment, impact grading |
 | `aggregate_sentiment` | Daily 22:00 UTC | Rebuild daily rollups |
 | `prune` | Daily 03:30 UTC | Retention |

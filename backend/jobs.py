@@ -18,8 +18,10 @@ from services import calendar, events, news, prices, sentiment_service, social
 _backfilling: set[str] = set()
 _backfill_lock = threading.Lock()
 
-# Monotonic stamp of the last refresh that actually ran, for the slow cadence.
-_last_price_refresh = 0.0
+# Monotonic stamp of the last full chart pass, for the hourly cadence. Minus
+# infinity, not 0.0: the monotonic clock can start near zero, so a machine up
+# for less than an hour would otherwise skip the start-up pass when shut.
+_last_price_refresh = float("-inf")
 
 # A fortnight of 5m bars. Long enough that every event reaches its attribution
 # window with bars still on disk, short enough that the table stays small.
@@ -28,21 +30,38 @@ INTRADAY_RETENTION_DAYS = 14
 
 # ── Scheduled ────────────────────────────────────────────────────────────
 
-def refresh_prices() -> dict:
-    """Quote + recent bars for every followed stock.
+def refresh_quotes() -> dict:
+    """Every minute. Spark quotes while a market is open; nothing otherwise."""
+    return prices.refresh_watchlist_quotes()
 
-    The scheduler ticks on the fast cadence so an open market is never more
-    than a few minutes stale. Outside trading hours the price cannot move, so
-    most of those ticks return here immediately and only one an hour goes to
-    the network — near-live when it matters, and quiet when it doesn't.
+
+def refresh_prices() -> dict:
+    """The chart chain, on a five-minute tick.
+
+    Once an hour, open or shut, it is the full pass: quote, recent daily bars,
+    splits and dividends for every followed stock. On the other ticks of an
+    open market it walks the chain only for quotes refresh_quotes left stale,
+    so a symbol spark misses — or spark failing outright — still gets today's
+    five-minute quote. Shut, those ticks return here immediately: the price
+    cannot move.
+
+    ponytail: bars, splits and dividends are hourly, so in session the chart's
+    last bar can trail the live quote by up to an hour, and a split's history
+    rescale can trail the post-split quote as long. "An hour" is 60 or 65
+    minutes: the pass is due on the first five-minute tick at or past the
+    hour, and a tick that lands a millisecond early waits for the next. Shorten
+    PRICE_REFRESH_MINUTES if that ever shows.
     """
     global _last_price_refresh
     now = time.monotonic()
-    if not markets_open() and now - _last_price_refresh < settings.PRICE_REFRESH_MINUTES * 60:
+    due = now - _last_price_refresh >= settings.PRICE_REFRESH_MINUTES * 60
+    if not due and not markets_open():
         return {"updated": [], "failed": [], "skipped": "markets closed"}
 
-    _last_price_refresh = now
-    return prices.refresh_watchlist(range_="5d")
+    if due:
+        _last_price_refresh = now
+        return prices.refresh_watchlist(range_="5d")
+    return prices.refresh_watchlist(stale_only=True)
 
 
 def refresh_intraday() -> dict:
@@ -166,7 +185,12 @@ def catch_up() -> dict:
 def refresh_all() -> dict:
     """Manual full refresh, exposed on POST /refresh."""
     return {
-        "prices": refresh_prices(),
+        # Not refresh_prices() while a market is open. Off the hour that tick
+        # only walks stale quotes, and whoever pressed refresh wants the bars,
+        # splits and dividends too. Shut, the hourly gate still applies: the
+        # price cannot move, so a second press has nothing new to fetch.
+        "prices": (prices.refresh_watchlist(range_="5d") if markets_open()
+                   else refresh_prices()),
         "intraday": refresh_intraday(),
         "news": refresh_news(),
         "sentiment_days": aggregate_sentiment(),
