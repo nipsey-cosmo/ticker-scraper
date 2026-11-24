@@ -35,15 +35,17 @@ def refresh_quotes() -> dict:
     return prices.refresh_watchlist_quotes()
 
 
+
 def refresh_prices() -> dict:
     """The chart chain, on a five-minute tick.
 
     Once an hour, open or shut, it is the full pass: quote, recent daily bars,
-    splits and dividends for every followed stock. On the other ticks of an
-    open market it walks the chain only for quotes refresh_quotes left stale,
-    so a symbol spark misses — or spark failing outright — still gets today's
-    five-minute quote. Shut, those ticks return here immediately: the price
-    cannot move.
+    splits, dividends and snapshots for every followed stock. On the other
+    ticks of an open market it walks the chain only for quotes that have gone
+    stale — the ones neither the price stream nor refresh_quotes is keeping
+    fresh, or all of them if both are down — so an open market is never more
+    than a few minutes stale either way. Shut, those ticks return here
+    immediately: the price cannot move.
 
     ponytail: bars, splits and dividends are hourly, so in session the chart's
     last bar can trail the live quote by up to an hour, and a split's history

@@ -1,25 +1,41 @@
 """Prices, free of charge, with a real fallback chain.
 
-While a market is open, quotes come first from Yahoo spark: one request per
-twenty followed stocks, every minute (`refresh_watchlist_quotes`). It writes
-the quote and nothing else — its series is a close-only 5m line, not daily
-bars. Spark is undocumented, so nothing relies on it alone. Beneath it sits the
-per-stock chain, walked every five minutes for any quote spark has left stale
-and hourly for every stock, because only the chart call brings daily bars,
-splits and dividends:
+While a market is open, quotes arrive three ways, freshest first:
+
+    0. Yahoo stream    — services/stream.py, quote row only, seconds old
+    0. Yahoo spark     — one request per twenty stocks, every minute, quote only
+
+and beneath both sits the per-stock chain, walked every five minutes for any
+quote the two above have left stale and hourly for every stock, because only
+the chart call brings daily bars, splits and dividends:
 
     1. Yahoo chart v8  — quote *and* daily history in one request, two hosts
     2. Nasdaq quote    — US listings, real-time during the session, own host
     3. CNBC quote API  — independent host, no key, global coverage
 
-If spark misses a symbol or vanishes outright, quotes degrade to exactly that
-five-minute chain. The costs of the split, stated rather than hidden: today's
-daily bar is refreshed hourly, so in session the chart's last point can trail
-the header price by up to an hour, and a split's rescale of stored history can
-trail the post-split quote by as long. Every quote write also fires the
-`stocks` change notification, so open browser tabs re-fetch each minute during
-a session — twice when prices moved, because the snapshots and the quotes
-commit separately and land in two notification windows.
+The stream sits above the chain rather than in it. It is a long-lived socket in
+the scheduler process that writes the latest regular-session tick for every
+followed stock it can price. Spark (`refresh_watchlist_quotes`) is the
+gap-filler under it: the stocks the stream does not feed — minor-unit listings
+(pence, cents) are not streamed yet, see the ponytail in stream._session — and
+every stock while the socket is down. It writes the quote and nothing else; its
+series is a close-only 5m line, not daily bars. Both are undocumented, so
+nothing relies on either alone.
+
+Nothing tells the poll that the stream or spark is down. A quote that neither
+is feeding simply ages past two spark intervals and the five-minute chain takes
+it back, at exactly the attempt rate from before either existed. The hourly
+full pass ignores freshness, so daily bars, splits, dividends and snapshots
+keep arriving for every stock.
+
+The costs of the split, stated rather than hidden: today's daily bar is
+refreshed hourly, so in session the chart's last point can trail the header
+price by up to an hour, and a split's rescale of stored history can trail the
+post-split quote by as long. Every quote write also fires the `stocks` change
+notification, so open browser tabs re-fetch on every stream flush during a
+session, and on each spark pass too — twice when prices moved, because the
+snapshots and the quotes commit separately and land in two notification
+windows.
 
 History has its own fallback, because the chain above does not cover it: only
 Yahoo returns bars, so a Yahoo outage used to leave the quote fine and the
@@ -557,6 +573,10 @@ def refresh_watchlist(range_: str = "5d", stale_only: bool = False) -> dict:
     opposite of the point. The per-host token buckets in the scraper still
     pace each source, so this parallelises across stocks without hitting any
     one source harder than the sequential version did.
+
+    Staleness is read from the database rather than asked of the stream thread
+    or the spark job, and that is the point: it needs no shared state, and a
+    source that dies hands its stocks back simply by going quiet.
     """
     if stale_only:
         cutoff = to_iso(now_utc() - timedelta(minutes=2 * settings.QUOTE_REFRESH_MINUTES))

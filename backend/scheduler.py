@@ -5,16 +5,21 @@ request, and so restarting the API doesn't interrupt a refresh.
 """
 from __future__ import annotations
 
+import threading
+
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 import db
 import jobs
 import settings
+from services import stream
 
 scheduler = BlockingScheduler(timezone="UTC")
 
 # Batch quotes every minute; the job returns at once whenever every market is
 # shut, so it buys a one-minute price in session without scraping all night.
+# Beneath the price stream (started in main) it is the gap-filler: the stocks
+# the stream does not feed, and all of them while the socket is down.
 scheduler.add_job(
     jobs.refresh_quotes, "interval",
     minutes=settings.QUOTE_REFRESH_MINUTES, id="quotes",
@@ -23,7 +28,8 @@ scheduler.add_job(
 
 # The chart chain on a five-minute tick: the full pass (daily bars, splits,
 # dividends) once an hour, and in between, during a session, only the quotes
-# the spark job left stale. Shut, the in-between ticks do nothing.
+# that neither the stream nor the spark job kept fresh. Shut, the in-between
+# ticks do nothing.
 scheduler.add_job(
     jobs.refresh_prices, "interval",
     minutes=settings.PRICE_REFRESH_OPEN_MINUTES, id="prices",
@@ -74,8 +80,10 @@ scheduler.add_job(
 
 def main() -> None:
     db.create_tables()
-    print(f"[scheduler] quotes every {settings.QUOTE_REFRESH_MINUTES}m while a market is "
-          f"open (stale ones re-checked every {settings.PRICE_REFRESH_OPEN_MINUTES}m), "
+    print(f"[scheduler] live quotes from the Yahoo stream, flushed every "
+          f"{stream.FLUSH_SECONDS}s; batch quotes every "
+          f"{settings.QUOTE_REFRESH_MINUTES}m while a market is open (stale ones "
+          f"re-checked every {settings.PRICE_REFRESH_OPEN_MINUTES}m), "
           f"full price pass every {settings.PRICE_REFRESH_MINUTES}m, "
           f"news every {settings.NEWS_REFRESH_MINUTES}m "
           f"(filings every {settings.NEWS_FAST_MINUTES}m)")
@@ -88,6 +96,12 @@ def main() -> None:
     jobs.aggregate_sentiment()
     jobs.refresh_earnings()
     jobs.refresh_social()
+
+    # After the start-up price pass, so every followed symbol has been charted
+    # and yahoo.minor_units knows its divisor: the stream drops a tick it
+    # cannot scale rather than guess. Daemon, so Ctrl+C is not held up by a
+    # socket waiting on its next tick.
+    threading.Thread(target=stream.run, name="stream", daemon=True).start()
 
     try:
         scheduler.start()
