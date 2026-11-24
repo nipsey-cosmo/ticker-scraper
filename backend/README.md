@@ -170,7 +170,7 @@ from a fallback and stored history stops extending: degraded, not broken.
 **Live quotes come from Yahoo's WebSocket price stream**, above the chain rather
 than in it (`services/stream.py`). One long-lived connection in the scheduler
 process subscribes to every followed stock, keeps the latest regular-session
-tick per symbol, and writes them all in one statement every five seconds. It
+tick per symbol, and writes them all in one transaction every five seconds. It
 writes only the quote row: no snapshots, no bars. The ticks are protobuf,
 decoded by hand in `yahoo.parse_pricing` rather than pulling in the protobuf
 package for five fields. A follow or unfollow reaches the stream within 15
@@ -199,12 +199,16 @@ ticks arrive 15 minutes old, the same price the chart serves).
 What the stream costs, honestly:
 
 - Each five-second write fires the `stocks` change notification, so open
-  browser tabs re-fetch every five seconds during a session where they did
-  every five minutes. `stream.FLUSH_SECONDS` is the knob.
+  browser tabs re-fetch every five seconds where they did every five minutes.
+  That is every query on screen, not only prices: the client invalidates its
+  whole cache on each message. With a crypto pair followed it also never
+  stops, since that ticks around the clock. `stream.FLUSH_SECONDS` is the knob.
 - Today's daily bar lags up to an hour for a streamed stock, since only the
   hourly pass writes bars for it.
-- A newly followed stock waits for its first chart call (up to five minutes)
-  to learn its divisor before it streams.
+- A newly followed stock waits for its first chart call in the scheduler
+  process to learn its divisor before it streams: up to five minutes while a
+  market is open, up to an hour once every market is shut. The backfill a
+  follow triggers does not count, because it runs in the API process.
 - The 5m intraday job is untouched, so Yahoo requests per stock-hour fall from
   24 to about 13, not to 1.
 - Not yet verified: that pre-market ticks arrive with the session flag absent,
