@@ -22,6 +22,11 @@ one `bulk_set_quotes` every FLUSH_SECONDS. That write fires the `stocks`
 notify trigger, so open browser tabs re-fetch every FLUSH_SECONDS while a
 session runs; it is the knob if that ever costs too much.
 
+A tick carries its own timestamp, and one more than MAX_TICK_AGE_SECONDS old
+is dropped. The server replays the last tick of a shut market at odd moments
+with the regular-session flag still set, hours or days after the close;
+stored, it would stamp an old price as updated now and keep the poll away.
+
 There is no silence timer. Without a holiday calendar a closed market looks
 exactly like a mute server, so stale-connection detection is the library's
 ping, the re-subscribe every RESUBSCRIBE_SECONDS, and the database staleness
@@ -59,6 +64,14 @@ MAX_BACKOFF_SECONDS = 300
 
 # marketHours on a tick. 2 is post-market; pre-market is 0, so it never arrives.
 _REGULAR = 1
+
+# A tick older than this by its own timestamp is a replay, not a quote. The
+# server re-sends the last tick of a shut market now and then, still flagged
+# as the regular session: ^FTSE four hours after the London close, ^N225 three
+# days after Tokyo's. Half an hour because a delayed exchange is live at a
+# distance: Tokyo ticks arrive a steady 15 minutes old, the same delayed price
+# the chart serves, and US ticks ran up to 47 s behind at the closing bell.
+MAX_TICK_AGE_SECONDS = 30 * 60
 
 
 def _connect():
@@ -120,6 +133,12 @@ def _session(ws, clock) -> int:
             # Regular session only, as prices._nasdaq_session does for the
             # poll: an extended-hours print is not the day's price.
             if tick["market_hours"] != _REGULAR:
+                continue
+            # The tick's own clock, not the moment it arrived. The write stamps
+            # the row as updated now, and that stamp is all that hands a quiet
+            # stock back to the poll, so a replayed price must never earn it.
+            # A tick with no time at all reads as 1970 and is dropped too.
+            if time.time() * 1000 - tick["time"] > MAX_TICK_AGE_SECONDS * 1000:
                 continue
             # No divisor means the symbol has not been charted since start-up.
             # Never guess one: a wrong guess is a 100x error on a stored price.

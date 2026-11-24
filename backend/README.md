@@ -189,7 +189,12 @@ explicit regular-session flag counts, the same rule as Nasdaq's
 `secondaryData` above), or when the symbol's minor-unit divisor is not known
 to be 1. The stream carries no currency for equities, so the divisor comes from
 the last chart call; a London line in pence stays on the poll until the
-stream's unit for it has been checked during London hours.
+stream's unit for it has been checked during London hours. A tick whose own
+timestamp is more than half an hour old is dropped as well: the server replays
+the last tick of a shut market hours or days later with the regular-session
+flag still set, and storing one would stamp an old price as fresh. Half an
+hour, not a minute, because a delayed exchange streams late by design (Tokyo
+ticks arrive 15 minutes old, the same price the chart serves).
 
 What the stream costs, honestly:
 

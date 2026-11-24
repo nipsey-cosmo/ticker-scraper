@@ -34,6 +34,9 @@ BTC_LIVE = (
     "3qAZ9nFC9QIAEsZD/QIivCY/"
 )
 AAPL_REGULAR = "CgRBQVBMFRROr0MYsJH9oMFoKgNOTVMwCDgBRfNoFkBIuMORHmXAzABBsAHIAdgBBPUCwMwAQf0C82gWQA=="
+# Received 2026-11-23 20:38:59 UTC, four hours after the London close, and
+# still flagged as the regular session. Its own timestamp says 16:35:30.
+FTSE_REPLAYED = "CgVeRlRTRRVIwyNGGKDhmZTBaCIDR0JQKgNGR0kwCTgBRXNfpj9lAHsGQ9gBBPUCAHsGQ/0Cc1+mPw=="
 
 
 def _varint(n: int) -> bytes:
@@ -46,11 +49,16 @@ def _varint(n: int) -> bytes:
 
 
 def encode(symbol: str, price: float, market_hours: int = 1,
-           change: float = 1.5, change_percent: float = 0.5) -> str:
+           change: float = 1.5, change_percent: float = 0.5,
+           age: float | None = 0.0) -> str:
     """A base64 tick in the stream's own encoding. market_hours=0 is omitted,
-    exactly as proto3 would."""
+    exactly as proto3 would. `age` is how many seconds old the tick says it
+    is; None leaves the time field out altogether."""
     name = symbol.encode()
     body = b"\x0a" + _varint(len(name)) + name + b"\x15" + struct.pack("<f", price)
+    if age is not None:
+        # sint64, zigzag: a non-negative n travels as 2n.
+        body += b"\x18" + _varint(int((time.time() - age) * 1000) << 1)
     if market_hours:
         body += b"\x38" + _varint(market_hours)
     body += b"\x45" + struct.pack("<f", change_percent) + b"\x65" + struct.pack("<f", change)
@@ -134,6 +142,12 @@ class TestDecode:
 
     def test_truncated_payload_returns_none(self):
         assert yahoo.parse_pricing(BTC_TRUNCATED) is None
+        # The capture lost its base64 padding too, which alone is fatal. Put
+        # it back and the cut protobuf underneath must still be refused: the
+        # last field has a tag and no value.
+        padded = BTC_TRUNCATED + "=" * (-len(BTC_TRUNCATED) % 4)
+        assert base64.b64decode(padded, validate=True)
+        assert yahoo.parse_pricing(padded) is None
 
     @pytest.mark.parametrize("junk", [None, "", "not base64!", "CgRBQVBM", "/////w=="])
     def test_malformed_input_returns_none_rather_than_raising(self, junk):
@@ -180,6 +194,8 @@ class TestSession:
         assert [(q["short_name"], q["price"]) for q in streaming[0]] == [("AAPL", 342.5)]
         stored = db.stocks.get_stock("AAPL")
         assert stored["price"] == 342.5
+        # Each to its own column: the percent is a percent (0.5, not 0.005).
+        assert (stored["price_change"], stored["price_change_percent"]) == (1.5, 0.5)
         assert stored["quote_currency"] == "USD"      # a None currency keeps it
 
     def test_a_post_market_tick_never_reaches_the_stock_row(self, streaming):
@@ -190,6 +206,37 @@ class TestSession:
         after = db.stocks.get_stock("AAPL")
         assert (after["price"], after["price_updated_at"]) == (
             before["price"], before["price_updated_at"])
+
+    def test_a_replayed_tick_from_a_shut_market_is_not_stored(self, streaming):
+        # The captured replay, for a followed listing the stream may price.
+        db.stocks.upsert_stock("UKX", "FTSE 100")
+        db.stocks.set_resolution("UKX", "^FTSE", "FGI", "GBP")
+        db.watchlist.add("UKX")
+        yahoo.minor_units["^FTSE"] = 1.0
+        assert yahoo.parse_pricing(FTSE_REPLAYED)["market_hours"] == 1
+
+        session(json.dumps({"type": "pricing", "message": FTSE_REPLAYED}), WAIT)
+
+        assert streaming == []
+        assert db.stocks.get_stock("UKX")["price_updated_at"] is None
+
+    @pytest.mark.parametrize("age, stored", [
+        (5, True),
+        (15 * 60 + 2, True),      # Tokyo: a delayed exchange, live at a distance
+        (stream.MAX_TICK_AGE_SECONDS + 30, False),
+        (None, False),            # no time field at all
+    ])
+    def test_only_a_tick_that_is_itself_recent_is_stored(self, streaming, age, stored):
+        # Storing an old tick would stamp its price as updated now, and a
+        # fresh stamp is exactly what keeps the poll away from the stock.
+        before = db.stocks.get_stock("AAPL")
+        session(tick("AAPL", 400.0, age=age), WAIT)
+
+        after = db.stocks.get_stock("AAPL")
+        assert len(streaming) == (1 if stored else 0)
+        assert after["price"] == (400.0 if stored else before["price"])
+        if not stored:
+            assert after["price_updated_at"] == before["price_updated_at"]
 
     def test_tick_lands_on_the_short_name_not_the_yahoo_symbol(self, streaming):
         # A second short name for the same listing must move with it.
